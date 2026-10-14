@@ -45,12 +45,58 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	var backup *appStateVersionBackup
 	if fullSync {
-		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
-		if err != nil {
-			return nil, fmt.Errorf("failed to reset app state %s version: %w", name, err)
+		// Capture the current verified state so a failed full sync can put it
+		// back instead of leaving the collection empty. Without this, accounts
+		// whose full sync can never verify (e.g. after a PN→LID migration on
+		// the primary) lose a previously adopted good state on every resync.
+		// The capture+delete pair is atomic with respect to recovery writes
+		// (appStateRecoveryLock), so the captured copy cannot miss a recovery
+		// adopted in between.
+		var deleteErr error
+		func() {
+			cli.appStateRecoveryLock.Lock()
+			defer cli.appStateRecoveryLock.Unlock()
+			var captureErr error
+			backup, captureErr = captureAppStateVersion(ctx, cli.Store.AppState, string(name))
+			if captureErr != nil {
+				cli.Log.Warnf("Failed to capture app state %s before full sync (falling back to destructive resync): %v", name, captureErr)
+				backup = nil
+			} else if backup == nil {
+				// The capture found NO prior state at all (nil, nil): this
+				// full sync may bootstrap from a snapshot whose MAC does not
+				// verify (see appstate/bootstrap.go). A capture ERROR must
+				// never enable this, hence the else-if.
+				ctx = appstate.WithSnapshotBootstrap(ctx)
+			}
+			deleteErr = cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
+		}()
+		if deleteErr != nil {
+			return nil, fmt.Errorf("failed to reset app state %s version: %w", name, deleteErr)
 		}
 	}
+	eventsToDispatch, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
+	if err != nil && backup != nil {
+		// Atomic check-then-restore: skip the restore when a recovery response
+		// adopted an equal-or-newer state while the full sync was downloading,
+		// instead of regressing it to the captured copy (and diverging from
+		// what the caller already persisted from the recovery's events).
+		cli.appStateRecoveryLock.Lock()
+		restored, restoreErr := restoreAppStateVersionIfOlder(ctx, cli.Store.AppState, string(name), backup)
+		cli.appStateRecoveryLock.Unlock()
+		if restoreErr != nil {
+			cli.Log.Errorf("Failed to restore app state %s v%d after failed full sync: %v", name, backup.Version, restoreErr)
+		} else if !restored {
+			cli.Log.Infof("Full sync of app state %s failed, but local state is already at v%d or newer (likely a recovery response); not restoring the captured copy: %v", name, backup.Version, err)
+		} else {
+			cli.Log.Warnf("Full sync of app state %s failed, restored previous local state (v%d): %v", name, backup.Version, err)
+		}
+	}
+	return eventsToDispatch, err
+}
+
+func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get app state %s version: %w", name, err)
@@ -103,6 +149,7 @@ func (cli *Client) handleAppStateRecovery(
 	reqID types.MessageID,
 	result []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult,
 ) bool {
+	cli.diagRecordRecoveryResponse(ctx, reqID, result)
 	if len(result) == 0 || result[0].GetSyncdSnapshotFatalRecoveryResponse() == nil {
 		cli.Log.Warnf("No app state recovery data received for %s", reqID)
 		return true
@@ -121,18 +168,34 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
-	currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
-	if err != nil {
-		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
-		return true
-	} else if currentVersion >= version {
-		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
-		return true
-	}
-	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
-	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
-	if err != nil {
-		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
+	// The version check and the adoption write must be atomic with respect to
+	// a concurrent full sync's capture/delete and restore (fetchAppState), or
+	// the restore of a failed full sync could overwrite the adopted state.
+	// This deliberately does NOT take appStateSyncLock: that one is held for
+	// the whole full sync (download included), and this code runs on the
+	// message-handling path, which must not stall for minutes. The lock is
+	// released before dispatching events, as handlers may fetch app state
+	// themselves (which takes appStateSyncLock, then appStateRecoveryLock).
+	mutations, ok := func() ([]appstate.Mutation, bool) {
+		cli.appStateRecoveryLock.Lock()
+		defer cli.appStateRecoveryLock.Unlock()
+		currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+		if err != nil {
+			cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
+			return nil, false
+		} else if currentVersion > version {
+			cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
+			return nil, false
+		}
+		cli.Log.Debugf("Handling app state recovery response for %s", reqID)
+		mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
+		if err != nil {
+			cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
+			return nil, false
+		}
+		return mutations, true
+	}()
+	if !ok {
 		return true
 	}
 	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
@@ -563,7 +626,19 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 
 	state := appstate.HashState{Version: version, Hash: hash}
 
-	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	// On LID-migrated accounts, write chat actions the way WhatsApp Web does:
+	// index under the chat's LID plus REMOVE mutations for stale PN-twin
+	// entries in the same patch (no-op otherwise, see appstate/lidwrite.go).
+	// The original patch is kept for the retry path so the expansion is
+	// re-done against fresh local state.
+	patchToEncode := patch
+	if expanded, expandErr := cli.appStateProc.ExpandPatchForLID(ctx, patch); expandErr != nil {
+		cli.Log.Warnf("Failed to expand %s app state patch for LID migration (sending unchanged): %v", patch.Type, expandErr)
+	} else {
+		patchToEncode = expanded
+	}
+
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patchToEncode)
 	if err != nil {
 		return err
 	}
@@ -624,6 +699,9 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 		}
 		return mainErr
 	}
+	// The server stored the patch at version+1; remember it so its echo is not
+	// counted as the primary confirming the local hash (appstate/companion.go).
+	cli.appStateProc.NoteOwnPatch(patch.Type, version+1)
 	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)

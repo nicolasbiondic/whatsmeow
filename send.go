@@ -1099,6 +1099,11 @@ func (cli *Client) preparePeerMessageNode(
 	} else if message.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND {
 		attrs["push_priority"] = "high_force"
 		attrs["privacy_sensitive"] = "1"
+	} else if message.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY {
+		// WhatsApp Web sends app state peer requests with a high push priority
+		// (WAWebSendMsgCreateDeviceStanza). Without it a primary device whose
+		// app is in the background is not woken up and never answers.
+		attrs["push_priority"] = "high"
 	}
 	start := time.Now()
 	plaintext, err := proto.Marshal(message)

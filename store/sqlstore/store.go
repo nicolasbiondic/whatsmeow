@@ -435,6 +435,7 @@ const (
 	getAllAppStateSyncKeysQuery     = `SELECT key_data, timestamp, fingerprint FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC`
 	getAppStateSyncKeyQuery         = `SELECT key_data, timestamp, fingerprint FROM whatsmeow_app_state_sync_keys WHERE jid=$1 AND key_id=$2`
 	getLatestAppStateSyncKeyIDQuery = `SELECT key_id FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC LIMIT 1`
+	getAllAppStateSyncKeyIDsQuery   = `SELECT key_id FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC`
 )
 
 func (s *SQLStore) PutAppStateSyncKey(ctx context.Context, id []byte, key store.AppStateSyncKey) error {
@@ -472,6 +473,26 @@ func (s *SQLStore) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, erro
 	return keyID, err
 }
 
+// GetAllAppStateSyncKeyIDs returns the IDs of every stored app state sync key,
+// newest first. Used by appstate.ExpandPatchForLID to search the local app
+// state under every known key.
+func (s *SQLStore) GetAllAppStateSyncKeyIDs(ctx context.Context) ([][]byte, error) {
+	rows, err := s.db.Query(ctx, getAllAppStateSyncKeyIDsQuery, s.JID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keyIDs [][]byte
+	for rows.Next() {
+		var keyID []byte
+		if err = rows.Scan(&keyID); err != nil {
+			return nil, err
+		}
+		keyIDs = append(keyIDs, keyID)
+	}
+	return keyIDs, rows.Err()
+}
+
 const (
 	putAppStateVersionQuery = `
 		INSERT INTO whatsmeow_app_state_version (jid, name, version, hash) VALUES ($1, $2, $3, $4)
@@ -483,6 +504,21 @@ const (
 	deleteAppStateMutationMACsQueryPostgres = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
 	deleteAppStateMutationMACsQueryGeneric  = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
 	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	// Latest value per index MAC, matching the semantics of getAppStateMutationMACQuery.
+	// Set-based (one scan of the (jid, name) range plus a window over it): the
+	// previous correlated MAX(version) subquery could not seek by index_mac
+	// (the PK starts with (jid, name, version)) and re-scanned the whole
+	// collection for every row, which took over a minute on a 34k-row
+	// collection and held the SQLite read lock for the whole time.
+	getAllAppStateMutationMACsQuery = `
+		SELECT index_mac, value_mac FROM (
+			SELECT index_mac, value_mac, version,
+			       MAX(version) OVER (PARTITION BY index_mac) AS latest_version
+			FROM whatsmeow_app_state_mutation_macs
+			WHERE jid=$1 AND name=$2
+		) macs
+		WHERE version=latest_version
+	`
 )
 
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
@@ -578,6 +614,26 @@ func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, inde
 		err = nil
 	}
 	return
+}
+
+// GetAllAppStateMutationMACs returns the latest value MAC for every index MAC
+// stored for the given collection. Used by the experimental app state LTHash
+// recovery (appstate/lidrecovery.go) to enumerate orphan candidates.
+func (s *SQLStore) GetAllAppStateMutationMACs(ctx context.Context, name string) ([]store.AppStateMutationMAC, error) {
+	rows, err := s.db.Query(ctx, getAllAppStateMutationMACsQuery, s.JID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var macs []store.AppStateMutationMAC
+	for rows.Next() {
+		var mac store.AppStateMutationMAC
+		if err = rows.Scan(&mac.IndexMAC, &mac.ValueMAC); err != nil {
+			return nil, err
+		}
+		macs = append(macs, mac)
+	}
+	return macs, rows.Err()
 }
 
 const (

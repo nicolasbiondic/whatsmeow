@@ -203,6 +203,7 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 		}
 		cli.dispatchEvent(&events.Connected{})
 		cli.closeSocketWaitChan()
+		go cli.diagOnConnect()
 	}()
 }
 

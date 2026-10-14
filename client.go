@@ -103,6 +103,13 @@ type Client struct {
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
+	// appStateRecoveryLock serializes the short app-state store write sections
+	// of a recovery response (handleAppStateRecovery → ProcessRecovery) with a
+	// full sync's capture/delete and restore (fetchAppState), so a restore
+	// cannot overwrite a recovery adopted mid-sync. It is deliberately NOT
+	// appStateSyncLock: the recovery response arrives on the message-handling
+	// path, which must not block for the duration of a whole full sync.
+	appStateRecoveryLock sync.Mutex
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool

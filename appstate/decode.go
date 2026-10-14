@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -284,8 +285,38 @@ func (proc *Processor) decodeSnapshot(
 		return
 	}
 
+	var out patchOutput
+	out.Mutations = newMutationsInput
+	alreadyDecoded := false
+
 	if validateMACs {
 		_, err = proc.validateSnapshotMAC(ctx, name, currentState, ss.GetKeyID().GetID(), ss.GetMac())
+		if err != nil && errors.Is(err, ErrMismatchingLTHash) {
+			// WhatsApp Web computes a snapshot's LTHash with one entry per index
+			// MAC (last record wins); whatsmeow sums duplicates. Retry that way.
+			if dedupState, ok := proc.trySnapshotDedup(ctx, name, initialState, ss); ok {
+				currentState = dedupState
+				err = nil
+			}
+		}
+		if err != nil && errors.Is(err, ErrMismatchingLTHash) && isSnapshotBootstrap(ctx) && companionToleranceEnabled(name) {
+			// Full sync with no prior local state (see bootstrap.go): decrypt
+			// and MAC-verify every record, and adopt the plain-sum hash only
+			// if the records prove the collection is LID-migrated. Otherwise
+			// the original error propagates and nothing is stored.
+			var bootOut patchOutput
+			bootOut.Mutations = newMutationsInput
+			if decodeErr := proc.decodeMutations(ctx, encryptedMutations, &bootOut, true, currentState.Version, fakeIndexesToRemove); decodeErr != nil {
+				proc.Log.Warnf("Snapshot bootstrap for %s v%d rejected: %v", name, currentState.Version, decodeErr)
+			} else if !hasLIDChatActionMutation(name, bootOut.Mutations[len(newMutationsInput):]) {
+				proc.Log.Warnf("Snapshot bootstrap for %s v%d rejected: no LID-indexed chat action among the %d records", name, currentState.Version, len(encryptedMutations))
+			} else {
+				proc.noteSnapshotBootstrap(name, currentState.Version, len(encryptedMutations))
+				out = bootOut
+				alreadyDecoded = true
+				err = nil
+			}
+		}
 		if err != nil {
 			if len(warn) > 0 {
 				proc.Log.Warnf("Warnings while updating hash for %s: %+v", name, warn)
@@ -295,12 +326,12 @@ func (proc *Processor) decodeSnapshot(
 		}
 	}
 
-	var out patchOutput
-	out.Mutations = newMutationsInput
-	err = proc.decodeMutations(ctx, encryptedMutations, &out, validateMACs, currentState.Version, fakeIndexesToRemove)
-	if err != nil {
-		err = fmt.Errorf("failed to decode snapshot of v%d: %w", currentState.Version, err)
-		return
+	if !alreadyDecoded {
+		err = proc.decodeMutations(ctx, encryptedMutations, &out, validateMACs, currentState.Version, fakeIndexesToRemove)
+		if err != nil {
+			err = fmt.Errorf("failed to decode snapshot of v%d: %w", currentState.Version, err)
+			return
+		}
 	}
 	err = proc.storeMACs(ctx, name, currentState, &out)
 	if err != nil {
@@ -316,10 +347,15 @@ func (proc *Processor) validatePatch(
 	patch *waServerSync.SyncdPatch,
 	currentState HashState,
 	validateMACs bool,
-) (newState HashState, warn []error, err error) {
+) (newState HashState, recoveredOrphans []store.AppStateMutationMAC, warn []error, err error) {
 	version := patch.GetVersion().GetVersion()
 	newState = currentState
 	newState.Version = version
+	// Number of SET mutations whose previous value MAC was found neither in
+	// the patch nor in the local database. This is the signature of the
+	// PN→LID migration (issue #858): the primary subtracted the value of an
+	// equivalent entry under a different (PN) index MAC.
+	var missingPrevSETs int
 	warn, err = newState.updateHash(patch.GetMutations(), func(indexMAC []byte, maxIndex int) ([]byte, error) {
 		for i := maxIndex - 1; i >= 0; i-- {
 			if hmac.Equal(patch.Mutations[i].GetRecord().GetIndex().GetBlob(), indexMAC) {
@@ -332,7 +368,11 @@ func (proc *Processor) validatePatch(
 			}
 		}
 		// Previous value not found in current patch, look in the database
-		return proc.Store.AppState.GetAppStateMutationMAC(ctx, string(patchName), indexMAC)
+		vm, dbErr := proc.Store.AppState.GetAppStateMutationMAC(ctx, string(patchName), indexMAC)
+		if dbErr == nil && vm == nil && patch.Mutations[maxIndex].GetOperation() == waServerSync.SyncdMutation_SET {
+			missingPrevSETs++
+		}
+		return vm, dbErr
 	})
 	if err != nil {
 		err = fmt.Errorf("failed to update state hash: %w", err)
@@ -342,13 +382,42 @@ func (proc *Processor) validatePatch(
 	if validateMACs {
 		var keys ExpandedAppStateKeys
 		keys, err = proc.validateSnapshotMAC(ctx, patchName, newState, patch.GetKeyID().GetID(), patch.GetSnapshotMAC())
+		author := authorOf(patch)
+		tolerated := false
+		if err != nil && errors.Is(err, ErrMismatchingLTHash) && companionToleranceEnabled(patchName) &&
+			(!author.primary || proc.isCollectionLIDMigratedForDecode(ctx, patchName)) {
+			// The author signed this patch with its own diverged hash (see
+			// companion.go). Apply it with the local hash, as WhatsApp Web
+			// does, provided the patch MAC below verifies. For the primary
+			// this is only done on LID-migrated collections.
+			tolerated = true
+			err = nil
+		}
+		if err != nil && errors.Is(err, ErrMismatchingLTHash) {
+			// Not tolerated: attempt the mapping-free LID migration recovery
+			// (see lidrecovery.go). The recovered state is only accepted if
+			// the snapshot MAC verifies after subtracting the orphan
+			// candidates; otherwise the original error is returned.
+			orphans, fixedState, ok := proc.tryLTHashRecovery(ctx, patchName, newState, keys, patch, missingPrevSETs)
+			if ok {
+				newState = fixedState
+				recoveredOrphans = orphans
+				err = nil
+			}
+		}
 		if err != nil {
+			proc.noteFailedPatch(patchName, version, author, err)
 			return
 		}
 		patchMAC := generatePatchMAC(patch, patchName, keys.PatchMAC, patch.GetVersion().GetVersion())
 		if !hmac.Equal(patchMAC, patch.GetPatchMAC()) {
 			err = fmt.Errorf("failed to verify patch v%d: %w", version, ErrMismatchingPatchMAC)
 			return
+		}
+		if tolerated {
+			proc.noteToleratedPatch(patchName, version, author)
+		} else {
+			proc.noteVerifiedPatch(patchName, version, author)
 		}
 	}
 	return
@@ -361,6 +430,10 @@ func (proc *Processor) DecodePatches(
 	initialState HashState,
 	validateMACs bool,
 ) (newMutations []Mutation, currentState HashState, err error) {
+	// Diagnostic mode: persist the downloaded encrypted snapshot/patches
+	// before attempting any verification. No-op unless enabled via env var.
+	proc.dumpPatchListForDiag(list)
+
 	currentState = initialState
 	var expectedLength int
 	if list.Snapshot != nil {
@@ -383,7 +456,8 @@ func (proc *Processor) DecodePatches(
 		var warn []error
 		var newState HashState
 		var fakeIndexesToRemove map[[32]byte][]byte
-		newState, warn, err = proc.validatePatch(ctx, list.Name, patch, currentState, validateMACs)
+		var recoveredOrphans []store.AppStateMutationMAC
+		newState, recoveredOrphans, warn, err = proc.validatePatch(ctx, list.Name, patch, currentState, validateMACs)
 		if err != nil {
 			if len(warn) > 0 {
 				proc.Log.Warnf("Warnings while updating hash for %s: %+v", list.Name, warn)
@@ -395,6 +469,11 @@ func (proc *Processor) DecodePatches(
 		err = proc.decodeMutations(ctx, patch.GetMutations(), &out, validateMACs, newState.Version, fakeIndexesToRemove)
 		if err != nil {
 			return
+		}
+		// Entries recovered by the LID hack are no longer part of the server's
+		// LTHash, so drop them from the local MAC store to stay consistent.
+		for _, orphan := range recoveredOrphans {
+			out.RemoveMAC(orphan.IndexMAC)
 		}
 		err = proc.storeMACs(ctx, list.Name, newState, &out)
 		if err != nil {

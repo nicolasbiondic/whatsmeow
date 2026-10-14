@@ -1,6 +1,7 @@
 package appstate
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -24,6 +25,18 @@ type MutationInfo struct {
 	Version int32
 	// Value contains the data for the mutation.
 	Value *waSyncAction.SyncActionValue
+	// Operation is the syncd operation for this mutation. The zero value is
+	// SET, which keeps the previous behavior of EncodePatch. REMOVE mutations
+	// delete the entry with the same index from the server state, subtracting
+	// its stored value MAC from the collection's LTHash (like WhatsApp Web's
+	// PN cleanup after the LID migration).
+	Operation waServerSync.SyncdMutation_SyncdOperation
+	// KeyID optionally overrides the patch-level key for this mutation only.
+	// WhatsApp Web uses this to emit REMOVEs under the (old) key ID that the
+	// removed entry was stored with, so that the index MAC matches the stored
+	// entry. When nil, the patch-level key is used. The patch-level key is
+	// always used for the snapshot and patch MACs.
+	KeyID []byte
 }
 
 // PatchInfo contains information about a patch to the app state.
@@ -291,20 +304,31 @@ func (proc *Processor) EncodePatch(ctx context.Context, keyID []byte, state Hash
 			return nil, fmt.Errorf("failed to marshal mutation: %w", err)
 		}
 
-		encryptedContent, err := cbcutil.Encrypt(keys.ValueEncryption, nil, content)
+		mutKeyID := keyID
+		mutKeys := keys
+		if len(mutationInfo.KeyID) > 0 && !bytes.Equal(mutationInfo.KeyID, keyID) {
+			mutKeyID = mutationInfo.KeyID
+			mutKeys, err = proc.getAppStateKey(ctx, mutKeyID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get app state key details with mutation key ID %x: %w", mutKeyID, err)
+			}
+		}
+		operation := mutationInfo.Operation
+
+		encryptedContent, err := cbcutil.Encrypt(mutKeys.ValueEncryption, nil, content)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encrypt mutation: %w", err)
 		}
 
-		valueMac := generateContentMAC(waServerSync.SyncdMutation_SET, encryptedContent, keyID, keys.ValueMAC)
-		indexMac := concatAndHMAC(sha256.New, keys.Index, indexBytes)
+		valueMac := generateContentMAC(operation, encryptedContent, mutKeyID, mutKeys.ValueMAC)
+		indexMac := concatAndHMAC(sha256.New, mutKeys.Index, indexBytes)
 
 		mutations = append(mutations, &waServerSync.SyncdMutation{
-			Operation: waServerSync.SyncdMutation_SET.Enum(),
+			Operation: operation.Enum(),
 			Record: &waServerSync.SyncdRecord{
 				Index: &waServerSync.SyncdIndex{Blob: indexMac},
 				Value: &waServerSync.SyncdValue{Blob: append(encryptedContent, valueMac...)},
-				KeyID: &waServerSync.KeyId{ID: keyID},
+				KeyID: &waServerSync.KeyId{ID: mutKeyID},
 			},
 		})
 	}
