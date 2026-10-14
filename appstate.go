@@ -46,6 +46,9 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	if cli.TolerateAppStateLTHashMismatch {
+		ctx = appstate.WithLTHashMismatchTolerance(ctx)
+	}
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {

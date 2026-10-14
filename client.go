@@ -96,6 +96,15 @@ type Client struct {
 	// even when re-syncing the whole state.
 	EmitAppStateEventsOnFullSync bool
 	AppStateDebugLogs            bool
+	// TolerateAppStateLTHashMismatch can be set to true to apply app state
+	// patches whose snapshot MAC doesn't verify against the locally computed
+	// LTHash instead of failing the sync. The patch MAC and each mutation's
+	// MACs are still verified, and snapshots are still rejected on mismatch.
+	// This matches WhatsApp Web, which only treats a MAC mismatch as fatal for
+	// snapshots. On accounts whose primary migrated chats to LID, devices sign
+	// patches with their own diverged collection hashes, so syncs fail with
+	// ErrMismatchingLTHash forever without this option.
+	TolerateAppStateLTHashMismatch bool
 
 	AutomaticMessageRerequestFromPhone bool
 	pendingPhoneRerequests             map[types.MessageID]context.CancelFunc

@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -342,6 +343,14 @@ func (proc *Processor) validatePatch(
 	if validateMACs {
 		var keys ExpandedAppStateKeys
 		keys, err = proc.validateSnapshotMAC(ctx, patchName, newState, patch.GetKeyID().GetID(), patch.GetSnapshotMAC())
+		if err != nil && errors.Is(err, ErrMismatchingLTHash) && isLTHashMismatchTolerated(ctx) {
+			// The author of this patch signed it with a collection hash that
+			// diverged from the locally computed one. Apply the patch anyway
+			// and keep the local hash; the patch MAC below and each mutation's
+			// MACs are still verified.
+			proc.Log.Warnf("Applying %s patch v%d (device %d) despite mismatching LTHash", patchName, version, patch.GetDeviceIndex())
+			err = nil
+		}
 		if err != nil {
 			return
 		}
@@ -355,6 +364,26 @@ func (proc *Processor) validatePatch(
 }
 
 // DecodePatches will decode all the patches in a PatchList into a list of app state mutations.
+type lthashMismatchToleranceCtxKey struct{}
+
+// WithLTHashMismatchTolerance marks a context so that DecodePatches applies
+// patches whose snapshot MAC does not verify against the locally computed
+// LTHash instead of failing. The patch MAC and each mutation's content and
+// index MACs are still verified, and snapshots are still rejected on mismatch.
+//
+// This matches WhatsApp Web, which only treats a MAC mismatch as fatal for
+// snapshots: patches are applied and the local hash is kept, because on
+// accounts whose primary migrated chats to LID, every device signs its patches
+// with its own diverged collection hash.
+func WithLTHashMismatchTolerance(ctx context.Context) context.Context {
+	return context.WithValue(ctx, lthashMismatchToleranceCtxKey{}, true)
+}
+
+func isLTHashMismatchTolerated(ctx context.Context) bool {
+	tolerated, _ := ctx.Value(lthashMismatchToleranceCtxKey{}).(bool)
+	return tolerated
+}
+
 func (proc *Processor) DecodePatches(
 	ctx context.Context,
 	list *PatchList,
