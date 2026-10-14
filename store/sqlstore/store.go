@@ -483,6 +483,21 @@ const (
 	deleteAppStateMutationMACsQueryPostgres = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=ANY($3::bytea[])`
 	deleteAppStateMutationMACsQueryGeneric  = `DELETE FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac IN `
 	getAppStateMutationMACQuery             = `SELECT value_mac FROM whatsmeow_app_state_mutation_macs WHERE jid=$1 AND name=$2 AND index_mac=$3 ORDER BY version DESC LIMIT 1`
+	// Latest value per index MAC, matching the semantics of getAppStateMutationMACQuery.
+	// Set-based (one scan of the (jid, name) range plus a window over it): a
+	// correlated MAX(version) subquery can't seek by index_mac (the primary
+	// key starts with (jid, name, version)) and re-scans the whole collection
+	// for every row, which takes minutes on collections with tens of
+	// thousands of rows.
+	getAllAppStateMutationMACsQuery = `
+		SELECT index_mac, value_mac FROM (
+			SELECT index_mac, value_mac, version,
+			       MAX(version) OVER (PARTITION BY index_mac) AS latest_version
+			FROM whatsmeow_app_state_mutation_macs
+			WHERE jid=$1 AND name=$2
+		) macs
+		WHERE version=latest_version
+	`
 )
 
 func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error {
@@ -578,6 +593,23 @@ func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, inde
 		err = nil
 	}
 	return
+}
+
+func (s *SQLStore) GetAllAppStateMutationMACs(ctx context.Context, name string) ([]store.AppStateMutationMAC, error) {
+	rows, err := s.db.Query(ctx, getAllAppStateMutationMACsQuery, s.JID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var macs []store.AppStateMutationMAC
+	for rows.Next() {
+		var mac store.AppStateMutationMAC
+		if err = rows.Scan(&mac.IndexMAC, &mac.ValueMAC); err != nil {
+			return nil, err
+		}
+		macs = append(macs, mac)
+	}
+	return macs, rows.Err()
 }
 
 const (

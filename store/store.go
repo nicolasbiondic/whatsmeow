@@ -78,6 +78,7 @@ type AppStateStore interface {
 	PutAppStateMutationMACs(ctx context.Context, name string, version uint64, mutations []AppStateMutationMAC) error
 	DeleteAppStateMutationMACs(ctx context.Context, name string, indexMACs [][]byte) error
 	GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error)
+	GetAllAppStateMutationMACs(ctx context.Context, name string) ([]AppStateMutationMAC, error)
 }
 
 type ContactEntry struct {
