@@ -312,6 +312,7 @@ func TestDumpPatchListForDiagOnlyRegularLow(t *testing.T) {
 	proc := &Processor{Store: &store.Device{}, Log: waLog.Noop}
 	dir := t.TempDir()
 	t.Setenv(diagDirEnvVar, dir)
+	t.Setenv(diagDumpsEnvVar, "1")
 
 	list := func(name WAPatchName) *PatchList {
 		return &PatchList{

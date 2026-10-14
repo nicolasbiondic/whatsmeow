@@ -4,8 +4,9 @@
 // nothing here changes how responses are processed.
 //
 //	WHATSMEOW_APPSTATE_DIAG_DIR=<dir>
-//	    Record peer_msg receipts and every recovery response (raw protobuf +
-//	    summary) in <dir>.
+//	    Record peer_msg receipts and every recovery response (summary) in
+//	    <dir>. The raw protobuf of a recovery response is additionally dumped
+//	    as a .pb file when WHATSMEOW_APPSTATE_DIAG_DUMPS=1 is also set.
 //
 // To send test requests, create <dir>/request-recovery containing a collection
 // name (e.g. "regular_low"). The process picks it up within 5 seconds, deletes
@@ -83,7 +84,9 @@ func (cli *Client) diagRecordRecoveryResponse(
 	record := map[string]any{"type": "recovery_response", "req_id": string(reqID), "results": len(result)}
 	if len(result) > 0 && result[0].GetSyncdSnapshotFatalRecoveryResponse() != nil {
 		resp := result[0].GetSyncdSnapshotFatalRecoveryResponse()
-		if raw, err := proto.Marshal(resp); err == nil {
+		// Raw .pb dumps are opt-in (WHATSMEOW_APPSTATE_DIAG_DUMPS=1); the
+		// parsed summary below is always recorded in the jsonl log.
+		if raw, err := proto.Marshal(resp); err == nil && os.Getenv("WHATSMEOW_APPSTATE_DIAG_DUMPS") == "1" {
 			fname := fmt.Sprintf("recovery-%s-%s.pb", reqID, time.Now().UTC().Format("20060102T150405Z"))
 			if err = os.WriteFile(filepath.Join(dir, fname), raw, 0o600); err == nil {
 				record["file"] = fname

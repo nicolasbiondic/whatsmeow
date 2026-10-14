@@ -27,11 +27,18 @@
 //	WHATSMEOW_APPSTATE_LID_RECOVERY=1
 //	    Apply the recovery to the local state when it verifies.
 //	WHATSMEOW_APPSTATE_DIAG_DIR=<dir>
-//	    Diagnostic mode: dump every downloaded (still encrypted) snapshot and
-//	    patch for monitored collections to <dir>, run the recovery search in
-//	    dry-run mode when verification fails and record whether it would have
-//	    matched, WITHOUT modifying local state (unless the first variable is
-//	    also set) and without writing anything to the server.
+//	    Diagnostic mode: record diagnostic events (patch verification results,
+//	    recovery attempts, alarms, …) in <dir>/appstate-diag.jsonl, run the
+//	    recovery search in dry-run mode when verification fails and record
+//	    whether it would have matched, WITHOUT modifying local state (unless
+//	    the first variable is also set) and without writing anything to the
+//	    server.
+//	WHATSMEOW_APPSTATE_DIAG_DUMPS=1
+//	    Additionally dump every downloaded (still encrypted) snapshot and
+//	    patch for monitored collections to <dir> as .pb files. Only has an
+//	    effect when WHATSMEOW_APPSTATE_DIAG_DIR is also set. Off by default
+//	    because a large account's snapshot dump is hundreds of kilobytes per
+//	    restart and the files pile up.
 package appstate
 
 import (
@@ -55,6 +62,7 @@ import (
 
 const lidRecoveryEnvVar = "WHATSMEOW_APPSTATE_LID_RECOVERY"
 const diagDirEnvVar = "WHATSMEOW_APPSTATE_DIAG_DIR"
+const diagDumpsEnvVar = "WHATSMEOW_APPSTATE_DIAG_DUMPS"
 
 // maxLTHashRecoveryCandidates caps the candidate set to keep the search cheap
 // (k=1 is O(N), k=2 is O(N²) HMACs with precomputed HKDF expansions).
@@ -72,6 +80,14 @@ func lidRecoveryApplyEnabled() bool {
 
 func appStateDiagDir() string {
 	return os.Getenv(diagDirEnvVar)
+}
+
+// appStateDiagDumpsEnabled reports whether raw .pb dumps of downloaded
+// snapshots/patches are enabled. The jsonl diagnostic records are written
+// whenever WHATSMEOW_APPSTATE_DIAG_DIR is set; the bulky .pb dumps are
+// opt-in via WHATSMEOW_APPSTATE_DIAG_DUMPS=1.
+func appStateDiagDumpsEnabled() bool {
+	return os.Getenv(diagDumpsEnvVar) == "1"
 }
 
 // allAppStateMutationMACsGetter is an optional extension of store.AppStateStore
@@ -240,12 +256,12 @@ func (proc *Processor) tryLTHashRecovery(
 }
 
 // dumpPatchListForDiag writes the downloaded (still encrypted) snapshot and
-// patches to the diagnostic directory. It is a no-op unless
-// WHATSMEOW_APPSTATE_DIAG_DIR is set. Failures are logged and ignored; this
-// must never affect the sync itself.
+// patches to the diagnostic directory. It is a no-op unless both
+// WHATSMEOW_APPSTATE_DIAG_DIR and WHATSMEOW_APPSTATE_DIAG_DUMPS=1 are set.
+// Failures are logged and ignored; this must never affect the sync itself.
 func (proc *Processor) dumpPatchListForDiag(list *PatchList) {
 	dir := appStateDiagDir()
-	if dir == "" {
+	if dir == "" || !appStateDiagDumpsEnabled() {
 		return
 	}
 	// Only the collection under investigation is dumped: regular_low is the
