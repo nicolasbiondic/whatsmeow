@@ -126,10 +126,14 @@ func (cli *Client) handleAppStateRecovery(
 	if err != nil {
 		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
 		return true
-	} else if currentVersion >= version {
-		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
+	} else if currentVersion > version {
+		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
 		return true
 	}
+	// A recovery response at the same version as the local state is adopted on
+	// purpose: the request is only sent when the local state does not verify,
+	// and the response carries the primary's LTHash and mutation MACs for that
+	// version, which replace the diverged local ones.
 	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
 	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
 	if err != nil {
