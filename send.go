@@ -1080,13 +1080,7 @@ func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
 	return types.EditAttributeEmpty
 }
 
-func (cli *Client) preparePeerMessageNode(
-	ctx context.Context,
-	to types.JID,
-	id types.MessageID,
-	message *waE2E.Message,
-	timings *MessageDebugTimings,
-) (*waBinary.Node, error) {
+func peerMessageAttributes(to types.JID, id types.MessageID, message *waE2E.Message) waBinary.Attrs {
 	attrs := waBinary.Attrs{
 		"id":       id,
 		"type":     "text",
@@ -1098,7 +1092,23 @@ func (cli *Client) preparePeerMessageNode(
 	} else if message.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND {
 		attrs["push_priority"] = "high_force"
 		attrs["privacy_sensitive"] = "1"
+	} else if message.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType() == waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY {
+		// WhatsApp Web sends app state fatal recovery requests with a high
+		// push priority too (WAWebSendMsgCreateDeviceStanza). Without it, a
+		// primary whose app is backgrounded isn't woken up and never answers.
+		attrs["push_priority"] = "high"
 	}
+	return attrs
+}
+
+func (cli *Client) preparePeerMessageNode(
+	ctx context.Context,
+	to types.JID,
+	id types.MessageID,
+	message *waE2E.Message,
+	timings *MessageDebugTimings,
+) (*waBinary.Node, error) {
+	attrs := peerMessageAttributes(to, id, message)
 	start := time.Now()
 	plaintext, err := proto.Marshal(message)
 	timings.Marshal = time.Since(start)
