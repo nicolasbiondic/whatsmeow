@@ -135,6 +135,26 @@ func (s *CachedLIDMap) GetPNForLID(ctx context.Context, lid types.JID) (types.JI
 	)
 }
 
+func (s *CachedLIDMap) GetAllLIDMappings(ctx context.Context) ([]store.LIDMapping, error) {
+	rows, err := s.db.Query(ctx, getAllLIDMappingsQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var mappings []store.LIDMapping
+	for rows.Next() {
+		var lidUser, pnUser string
+		if err = rows.Scan(&lidUser, &pnUser); err != nil {
+			return nil, err
+		}
+		mappings = append(mappings, store.LIDMapping{
+			LID: types.JID{User: lidUser, Server: types.HiddenUserServer},
+			PN:  types.JID{User: pnUser, Server: types.DefaultUserServer},
+		})
+	}
+	return mappings, rows.Err()
+}
+
 func (s *CachedLIDMap) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error) {
 	if len(pns) == 0 {
 		return nil, nil

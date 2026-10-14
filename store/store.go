@@ -63,6 +63,7 @@ type AppStateSyncKeyStore interface {
 	GetAppStateSyncKey(ctx context.Context, id []byte) (*AppStateSyncKey, error)
 	GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, error)
 	GetAllAppStateSyncKeys(ctx context.Context) ([]*AppStateSyncKey, error)
+	GetAllAppStateSyncKeyIDs(ctx context.Context) ([][]byte, error)
 }
 
 type AppStateMutationMAC struct {
@@ -191,6 +192,7 @@ type LIDStore interface {
 	GetPNForLID(ctx context.Context, lid types.JID) (types.JID, error)
 	GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, error)
 	GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error)
+	GetAllLIDMappings(ctx context.Context) ([]LIDMapping, error)
 }
 
 type AllSessionSpecificStores interface {

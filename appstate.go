@@ -564,7 +564,19 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 
 	state := appstate.HashState{Version: version, Hash: hash}
 
-	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patch)
+	// On LID-migrated accounts, write chat actions the way WhatsApp Web does:
+	// index under the chat's LID, plus REMOVE mutations for stale PN-twin and
+	// rotated-out-key entries in the same patch (no-op otherwise, see
+	// appstate/lidwrite.go). The original patch is kept for the retry path so
+	// the expansion is re-done against fresh local state.
+	patchToEncode := patch
+	if expanded, expandErr := cli.appStateProc.ExpandPatchForLID(ctx, patch); expandErr != nil {
+		cli.Log.Warnf("Failed to expand %s app state patch for LID migration (sending unchanged): %v", patch.Type, expandErr)
+	} else {
+		patchToEncode = expanded
+	}
+
+	encodedPatch, err := cli.appStateProc.EncodePatch(ctx, latestKeyID, state, patchToEncode)
 	if err != nil {
 		return err
 	}

@@ -137,6 +137,10 @@ func (n *NoopStore) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, err
 	return nil, n.Error
 }
 
+func (n *NoopStore) GetAllAppStateSyncKeyIDs(ctx context.Context) ([][]byte, error) {
+	return nil, n.Error
+}
+
 func (n *NoopStore) GetAllAppStateSyncKeys(ctx context.Context) ([]*AppStateSyncKey, error) {
 	return nil, nil
 }
@@ -290,6 +294,10 @@ func (n *NoopStore) GetLIDForPN(ctx context.Context, pn types.JID) (types.JID, e
 }
 
 func (n *NoopStore) GetManyLIDsForPNs(ctx context.Context, pns []types.JID) (map[types.JID]types.JID, error) {
+	return nil, n.Error
+}
+
+func (n *NoopStore) GetAllLIDMappings(ctx context.Context) ([]LIDMapping, error) {
 	return nil, n.Error
 }
 

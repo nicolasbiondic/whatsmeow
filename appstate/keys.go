@@ -155,13 +155,20 @@ type Processor struct {
 	keyCacheLock sync.Mutex
 	Store        *store.Device
 	Log          waLog.Logger
+
+	// lidMigratedCache caches positive "this collection has LID-indexed chat
+	// entries" results per collection (see lidwrite.go). Only true is cached:
+	// an account can become migrated at any time, but never un-migrated.
+	lidMigratedCache     map[WAPatchName]bool
+	lidMigratedCacheLock sync.Mutex
 }
 
 func NewProcessor(store *store.Device, log waLog.Logger) *Processor {
 	return &Processor{
-		keyCache: make(map[string]ExpandedAppStateKeys),
-		Store:    store,
-		Log:      log,
+		keyCache:         make(map[string]ExpandedAppStateKeys),
+		lidMigratedCache: make(map[WAPatchName]bool),
+		Store:            store,
+		Log:              log,
 	}
 }
 

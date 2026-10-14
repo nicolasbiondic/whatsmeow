@@ -435,6 +435,7 @@ const (
 	getAllAppStateSyncKeysQuery     = `SELECT key_data, timestamp, fingerprint FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC`
 	getAppStateSyncKeyQuery         = `SELECT key_data, timestamp, fingerprint FROM whatsmeow_app_state_sync_keys WHERE jid=$1 AND key_id=$2`
 	getLatestAppStateSyncKeyIDQuery = `SELECT key_id FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC LIMIT 1`
+	getAllAppStateSyncKeyIDsQuery   = `SELECT key_id FROM whatsmeow_app_state_sync_keys WHERE jid=$1 ORDER BY timestamp DESC`
 )
 
 func (s *SQLStore) PutAppStateSyncKey(ctx context.Context, id []byte, key store.AppStateSyncKey) error {
@@ -470,6 +471,23 @@ func (s *SQLStore) GetLatestAppStateSyncKeyID(ctx context.Context) ([]byte, erro
 		return nil, nil
 	}
 	return keyID, err
+}
+
+func (s *SQLStore) GetAllAppStateSyncKeyIDs(ctx context.Context) ([][]byte, error) {
+	rows, err := s.db.Query(ctx, getAllAppStateSyncKeyIDsQuery, s.JID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keyIDs [][]byte
+	for rows.Next() {
+		var keyID []byte
+		if err = rows.Scan(&keyID); err != nil {
+			return nil, err
+		}
+		keyIDs = append(keyIDs, keyID)
+	}
+	return keyIDs, rows.Err()
 }
 
 const (
