@@ -572,6 +572,18 @@ func (s *SQLStore) DeleteAppStateMutationMACs(ctx context.Context, name string, 
 	return
 }
 
+// PutAppStatePatch stores the version/hash and MAC changes of one patch in a single transaction.
+func (s *SQLStore) PutAppStatePatch(ctx context.Context, name string, version uint64, hash [128]byte, removedIndexMACs [][]byte, addedMACs []store.AppStateMutationMAC) error {
+	return s.db.DoTxn(ctx, nil, func(ctx context.Context) error {
+		if err := s.PutAppStateVersion(ctx, name, version, hash); err != nil {
+			return err
+		} else if err = s.DeleteAppStateMutationMACs(ctx, name, removedIndexMACs); err != nil {
+			return err
+		}
+		return s.PutAppStateMutationMACs(ctx, name, version, addedMACs)
+	})
+}
+
 func (s *SQLStore) GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error) {
 	err = s.db.QueryRow(ctx, getAppStateMutationMACQuery, s.JID, name, indexMAC).Scan(&valueMAC)
 	if errors.Is(err, sql.ErrNoRows) {
