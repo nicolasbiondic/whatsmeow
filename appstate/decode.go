@@ -228,6 +228,13 @@ func (proc *Processor) decodeMutations(
 }
 
 func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
+	if txStore, ok := proc.Store.AppState.(store.AppStatePatchStore); ok {
+		err := txStore.PutAppStatePatch(ctx, string(name), currentState.Version, currentState.Hash, out.RemovedMACs, out.AddedMACs)
+		if err != nil {
+			return fmt.Errorf("failed to store app state patch in the database: %w", err)
+		}
+		return nil
+	}
 	err := proc.Store.AppState.PutAppStateVersion(ctx, string(name), currentState.Version, currentState.Hash)
 	if err != nil {
 		return fmt.Errorf("failed to update app state version in the database: %w", err)

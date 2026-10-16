@@ -81,6 +81,16 @@ type AppStateStore interface {
 	GetAppStateMutationMAC(ctx context.Context, name string, indexMAC []byte) (valueMAC []byte, err error)
 }
 
+// AppStatePatchStore is an optional interface that AppStateStore implementations can implement to
+// persist everything one app state patch changes in a single transaction: the new version and
+// LTHash, the mutation MACs removed by the patch and the mutation MACs it added. When it's
+// implemented, the app state processor uses it instead of calling PutAppStateVersion,
+// DeleteAppStateMutationMACs and PutAppStateMutationMACs one after another, so a failure in any
+// of them (e.g. a duplicate MAC) can't leave a stored LTHash that disagrees with the stored MACs.
+type AppStatePatchStore interface {
+	PutAppStatePatch(ctx context.Context, name string, version uint64, hash [128]byte, removedIndexMACs [][]byte, addedMACs []AppStateMutationMAC) error
+}
+
 type ContactEntry struct {
 	JID       types.JID
 	FirstName string

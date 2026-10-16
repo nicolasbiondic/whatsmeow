@@ -1,6 +1,7 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"path/filepath"
@@ -160,4 +161,82 @@ func TestGetAllAppStateMutationMACsScalesLinearly(t *testing.T) {
 	if len(got) != rows {
 		t.Fatalf("got %d rows, want %d", len(got), rows)
 	}
+}
+
+// PutAppStatePatch must persist the version/hash row, the deletes and the
+// inserts of one patch all or nothing. Before it existed, DecodePatches wrote
+// them as three separate statements, so a UNIQUE violation on the insert left
+// the new LTHash stored with the old MACs (and any deletes already applied).
+func TestPutAppStatePatchIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	s := newTestAppStateStore(t)
+	const name = "regular_low"
+	var _ store.AppStatePatchStore = s
+
+	idxA, idxB := mac(0xA0), mac(0xB0)
+	var h1, h2, h3 [128]byte
+	h1[0], h2[0], h3[0] = 1, 2, 3
+
+	// v1: A→a1, B→b1.
+	if err := s.PutAppStatePatch(ctx, name, 1, h1, nil, []store.AppStateMutationMAC{
+		{IndexMAC: idxA, ValueMAC: mac(0xA1)},
+		{IndexMAC: idxB, ValueMAC: mac(0xB1)},
+	}); err != nil {
+		t.Fatalf("put v1: %v", err)
+	}
+	// v2: A→a2, B removed.
+	if err := s.PutAppStatePatch(ctx, name, 2, h2, [][]byte{idxB}, []store.AppStateMutationMAC{
+		{IndexMAC: idxA, ValueMAC: mac(0xA2)},
+	}); err != nil {
+		t.Fatalf("put v2: %v", err)
+	}
+	check := func(wantVersion uint64, wantHash [128]byte, wantA, wantB []byte) {
+		t.Helper()
+		version, hash, err := s.GetAppStateVersion(ctx, name)
+		if err != nil {
+			t.Fatalf("get version: %v", err)
+		}
+		if version != wantVersion || hash != wantHash {
+			t.Errorf("stored version/hash = %d/%x, want %d/%x", version, hash[:1], wantVersion, wantHash[:1])
+		}
+		gotA, err := s.GetAppStateMutationMAC(ctx, name, idxA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotA, wantA) {
+			t.Errorf("A = %x, want %x", gotA, wantA)
+		}
+		gotB, err := s.GetAppStateMutationMAC(ctx, name, idxB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotB, wantB) {
+			t.Errorf("B = %x, want %x", gotB, wantB)
+		}
+	}
+	check(2, h2, mac(0xA2), nil)
+
+	// A second application of "v2" (what the 409 race did): the insert of
+	// (v2, A) violates the primary key. Nothing of the call may persist, in
+	// particular not the version/hash row written before the insert, nor the
+	// delete of A that comes with it.
+	err := s.PutAppStatePatch(ctx, name, 2, h3, [][]byte{idxA}, []store.AppStateMutationMAC{
+		{IndexMAC: idxA, ValueMAC: mac(0xA3)},
+		{IndexMAC: idxA, ValueMAC: mac(0xA2)},
+	})
+	if err == nil {
+		t.Fatal("duplicate (version, index_mac) insert unexpectedly succeeded")
+	}
+	check(2, h2, mac(0xA2), nil)
+
+	// Same with a version bump: the UNIQUE violation is on an older version's
+	// row, so the version/hash update must be rolled back too.
+	if err = s.PutAppStateMutationMACs(ctx, name, 3, []store.AppStateMutationMAC{{IndexMAC: idxB, ValueMAC: mac(0xB3)}}); err != nil {
+		t.Fatal(err)
+	}
+	err = s.PutAppStatePatch(ctx, name, 3, h3, nil, []store.AppStateMutationMAC{{IndexMAC: idxB, ValueMAC: mac(0xB4)}})
+	if err == nil {
+		t.Fatal("duplicate (version, index_mac) insert unexpectedly succeeded")
+	}
+	check(2, h2, mac(0xA2), mac(0xB3))
 }
