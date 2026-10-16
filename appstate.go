@@ -692,11 +692,12 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 		}
 		if ok && errorTag.AttrGetter().Int("code") == 409 && allowRetry {
 			zerolog.Ctx(ctx).Warn().Err(mainErr).Msg("Failed to update app state, trying to apply conflicts and retry")
-			var eventsToDispatch []any
 			patches, err := appstate.ParsePatchList(ctx, &respCollection, cli.downloadExternalAppStateBlob)
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
-			} else if _, err = cli.applyAppStatePatches(ctx, patch.Type, state, patches, false, &eventsToDispatch); err != nil {
+			}
+			eventsToDispatch, err := cli.applyAppStateConflicts(ctx, patch.Type, patches)
+			if err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
@@ -724,6 +725,47 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	}()
 
 	return nil
+}
+
+// applyAppStateConflicts applies the patches the server returned alongside a
+// 409 conflict to a SendAppState request.
+//
+// It takes appStateSyncLock like fetchAppState does and applies the patches on
+// top of the state currently in the store, not the state the rejected patch
+// was encoded against: the server also notifies about the new versions, and
+// the notification-triggered fetchAppState may be applying (or have applied)
+// the very same patches while the send was in flight. Patches at or below
+// the stored version are skipped. Applying a patch twice is not idempotent:
+// the second application finds the first one's value MACs as the "previous
+// values", so the old values are never subtracted from the LTHash, and the
+// MAC insert fails with a duplicate key.
+func (cli *Client) applyAppStateConflicts(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) ([]any, error) {
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+	if err != nil {
+		return nil, fmt.Errorf("failed to get app state %s version: %w", name, err)
+	}
+	state := appstate.HashState{Version: version, Hash: hash}
+	if patches.Snapshot != nil && state != (appstate.HashState{}) {
+		return nil, fmt.Errorf("unexpected snapshot in conflict response for %s at v%d", name, version)
+	}
+	pending := *patches
+	pending.Patches = make([]*waServerSync.SyncdPatch, 0, len(patches.Patches))
+	for _, patch := range patches.Patches {
+		if patch.GetVersion().GetVersion() > version {
+			pending.Patches = append(pending.Patches, patch)
+		}
+	}
+	if len(pending.Patches) < len(patches.Patches) {
+		cli.Log.Debugf("Skipping %d of %d conflicting %s patches that were already applied (local version %d)", len(patches.Patches)-len(pending.Patches), len(patches.Patches), name, version)
+	}
+	if len(pending.Patches) == 0 && pending.Snapshot == nil {
+		return nil, nil
+	}
+	var eventsToDispatch []any
+	_, err = cli.applyAppStatePatches(ctx, name, state, &pending, false, &eventsToDispatch)
+	return eventsToDispatch, err
 }
 
 func (cli *Client) MarkNotDirty(ctx context.Context, cleanType string, ts time.Time) error {
