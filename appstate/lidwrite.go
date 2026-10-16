@@ -62,6 +62,17 @@ var chatActionIndexes = map[WAPatchName][]string{
 	WAPatchRegularHigh: {IndexMute},
 }
 
+// rotationCleanupIndexes lists, per collection, index types that are not
+// LID-rewritten chat actions but whose outgoing SETs still get WhatsApp Web's
+// rotated-out-key cleanup (_generateMutationsToUpload $()), independently of
+// LID migration: if the index being SET is stored locally under exactly one
+// app state key older than the latest one, a REMOVE of that index under the
+// old key is appended to the same patch. Deliberately restricted to the
+// mutations wacli sends; everything else is passed through unchanged.
+var rotationCleanupIndexes = map[WAPatchName][]string{
+	WAPatchCriticalUnblockLow: {IndexContact},
+}
+
 type expandedKey struct {
 	id   []byte
 	keys ExpandedAppStateKeys
@@ -279,6 +290,10 @@ func (proc *Processor) resolveChatJID(ctx context.Context, rawJID string) (res r
 //     hashes. An index stored under two or more older keys is ambiguous and
 //     is skipped (logged), keeping at most one REMOVE per plaintext index.
 //
+// For collections without LID-rewritten chat actions, only the rotated-out-key
+// cleanup of expandRotationCleanup applies (e.g. contact SETs in
+// critical_unblock_low), whether or not the account is LID-migrated.
+//
 // If the account is not LID-migrated (see isCollectionLIDMigrated), the chat
 // has no known PN↔LID mapping, or the patch contains no chat-action
 // mutations, the patch is returned unchanged. The returned PatchInfo never
@@ -286,7 +301,10 @@ func (proc *Processor) resolveChatJID(ctx context.Context, rawJID string) (res r
 // (e.g. on retry) without duplicating mutations.
 func (proc *Processor) ExpandPatchForLID(ctx context.Context, patchInfo PatchInfo) (PatchInfo, error) {
 	actions := chatActionIndexes[patchInfo.Type]
-	if len(actions) == 0 || proc.Store == nil || proc.Store.LIDs == nil || proc.Store.AppState == nil {
+	if len(actions) == 0 {
+		return proc.expandRotationCleanup(ctx, patchInfo, rotationCleanupIndexes[patchInfo.Type])
+	}
+	if proc.Store == nil || proc.Store.LIDs == nil || proc.Store.AppState == nil {
 		return patchInfo, nil
 	}
 	isChatAction := func(m MutationInfo) bool {
@@ -449,6 +467,122 @@ func (proc *Processor) ExpandPatchForLID(ctx context.Context, patchInfo PatchInf
 	}
 	out.Mutations = append(out.Mutations, removes...)
 	out.Mutations = append(out.Mutations, rotationRemoves...)
+	if dup := duplicateMutationIndex(out.Mutations); dup != "" {
+		proc.Log.Warnf("Expanded %s patch would repeat index %s within one operation; sending it unexpanded", patchInfo.Type, dup)
+		return patchInfo, nil
+	}
+	return out, nil
+}
+
+// expandRotationCleanup returns a copy of patchInfo where every SET whose
+// index type is in indexTypes, and whose index is stored locally under
+// exactly one app state key other than the latest (the one sendAppState
+// encodes with), is followed by a REMOVE of that same index under that old
+// key, appended after all other mutations in WhatsApp Web's order
+// (_generateMutationsToUpload $()). Without it the old-key row stays on the
+// server next to the new one, and a receiver in plaintext-index LTHash lookup
+// mode subtracts the stored row for the SET while whatsmeow does not,
+// diverging the hashes. An index stored under two or more old keys is
+// ambiguous and is skipped (logged). The patch is returned unchanged when
+// nothing applies; the result never aliases patchInfo.Mutations.
+func (proc *Processor) expandRotationCleanup(ctx context.Context, patchInfo PatchInfo, indexTypes []string) (PatchInfo, error) {
+	if len(indexTypes) == 0 || proc.Store == nil || proc.Store.AppState == nil || proc.Store.AppStateKeys == nil {
+		return patchInfo, nil
+	}
+	isTarget := func(m MutationInfo) bool {
+		if m.Operation != waServerSync.SyncdMutation_SET || len(m.KeyID) != 0 || len(m.Index) == 0 {
+			return false
+		}
+		for _, indexType := range indexTypes {
+			if m.Index[0] == indexType {
+				return true
+			}
+		}
+		return false
+	}
+	anyTarget := false
+	for _, m := range patchInfo.Mutations {
+		if isTarget(m) {
+			anyTarget = true
+			break
+		}
+	}
+	if !anyTarget {
+		return patchInfo, nil
+	}
+	macsGetter, ok := proc.Store.AppState.(allAppStateMutationMACsGetter)
+	if !ok {
+		return patchInfo, nil
+	}
+	keys, err := proc.getAllExpandedKeys(ctx)
+	if err != nil {
+		return patchInfo, err
+	}
+	if len(keys) == 0 {
+		return patchInfo, nil
+	}
+	latestKeyID, err := proc.Store.AppStateKeys.GetLatestAppStateSyncKeyID(ctx)
+	if err != nil {
+		return patchInfo, fmt.Errorf("failed to get latest app state key ID: %w", err)
+	}
+	macList, err := macsGetter.GetAllAppStateMutationMACs(ctx, string(patchInfo.Type))
+	if err != nil {
+		return patchInfo, fmt.Errorf("failed to list app state mutation MACs: %w", err)
+	}
+	macs := make(indexMACSet, len(macList))
+	for _, mac := range macList {
+		if len(mac.IndexMAC) == 32 {
+			macs[*(*[32]byte)(mac.IndexMAC)] = struct{}{}
+		}
+	}
+
+	var removes []MutationInfo
+	seenRemoves := make(map[string]bool)
+	for _, m := range patchInfo.Mutations {
+		if !isTarget(m) {
+			continue
+		}
+		found, err := findStoredIndexKeys(m.Index, keys, macs)
+		if err != nil {
+			return patchInfo, err
+		}
+		var oldKeys [][]byte
+		for _, k := range found {
+			if !bytes.Equal(k, latestKeyID) {
+				oldKeys = append(oldKeys, k)
+			}
+		}
+		if len(oldKeys) > 1 {
+			proc.Log.Warnf("Index %v is stored under %d old app state keys; not removing the stale rows", m.Index, len(oldKeys))
+			continue
+		}
+		if len(oldKeys) == 0 {
+			continue
+		}
+		indexBytes, err := json.Marshal(m.Index)
+		if err != nil {
+			return patchInfo, fmt.Errorf("failed to marshal index: %w", err)
+		}
+		if seenRemoves[string(indexBytes)] {
+			continue
+		}
+		seenRemoves[string(indexBytes)] = true
+		proc.Log.Infof("Adding REMOVE of %s index under rotated-out key %X to outgoing %s patch", m.Index[0], oldKeys[0], patchInfo.Type)
+		removes = append(removes, MutationInfo{
+			Index:     append([]string(nil), m.Index...),
+			Version:   m.Version,
+			Value:     &waSyncAction.SyncActionValue{},
+			Operation: waServerSync.SyncdMutation_REMOVE,
+			KeyID:     oldKeys[0],
+		})
+	}
+	if len(removes) == 0 {
+		return patchInfo, nil
+	}
+	out := patchInfo
+	out.Mutations = make([]MutationInfo, 0, len(patchInfo.Mutations)+len(removes))
+	out.Mutations = append(out.Mutations, patchInfo.Mutations...)
+	out.Mutations = append(out.Mutations, removes...)
 	if dup := duplicateMutationIndex(out.Mutations); dup != "" {
 		proc.Log.Warnf("Expanded %s patch would repeat index %s within one operation; sending it unexpanded", patchInfo.Type, dup)
 		return patchInfo, nil
