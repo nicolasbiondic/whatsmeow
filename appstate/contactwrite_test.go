@@ -29,6 +29,11 @@ type contactWriteEnv struct {
 
 func newContactWriteEnv(t *testing.T, targetUnderLatest bool) *contactWriteEnv {
 	t.Helper()
+	return newContactWriteEnvForTarget(t, targetUnderLatest, types.NewJID("51999000111", types.DefaultUserServer))
+}
+
+func newContactWriteEnvForTarget(t *testing.T, targetUnderLatest bool, target types.JID) *contactWriteEnv {
+	t.Helper()
 	base := &lidWriteEnv{
 		appState: newMemAppStateStore(),
 		keyStore: newFakeKeyStore(),
@@ -38,7 +43,7 @@ func newContactWriteEnv(t *testing.T, targetUnderLatest bool) *contactWriteEnv {
 	}
 	env := &contactWriteEnv{
 		lidWriteEnv: base,
-		target:      types.JID{User: "51999000111", Server: types.DefaultUserServer},
+		target:      target,
 		other:       types.JID{User: "51999000222", Server: types.DefaultUserServer},
 	}
 	oldKeyData := randBytes(t, 32)
@@ -70,6 +75,39 @@ func newContactWriteEnv(t *testing.T, targetUnderLatest bool) *contactWriteEnv {
 		LIDs:         base.lids,
 	}, waLog.Noop)
 	return env
+}
+
+// Rotation cleanup is index-preserving, including when the contact index is
+// already a LID. It must not silently change identity or depend on chat migration.
+func TestContactLIDIndexRotationVerifies(t *testing.T) {
+	for _, latest := range []bool{false, true} {
+		name := "rotated key"
+		if latest {
+			name = "latest key"
+		}
+		t.Run(name, func(t *testing.T) {
+			env := newContactWriteEnvForTarget(t, latest, types.NewJID("987654321000001", types.HiddenUserServer))
+			patch := buildContactSet(env.target, "New Name")
+			expanded, err := env.proc.ExpandPatchForLID(t.Context(), patch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 2
+			if latest {
+				want = 1
+			}
+			if len(expanded.Mutations) != want || expanded.Mutations[0].Index[1] != env.target.String() {
+				t.Fatalf("unexpected LID contact patch: %+v", expanded)
+			}
+			if !latest && (expanded.Mutations[1].Operation != waServerSync.SyncdMutation_REMOVE || string(expanded.Mutations[1].KeyID) != string(env.oldKeyID) || expanded.Mutations[1].Index[1] != env.target.String()) {
+				t.Fatalf("missing old-key LID removal: %+v", expanded.Mutations)
+			}
+			mutations, senderState := encodeContactPatch(t, env, expanded)
+			if waWebLTHashByIndexMAC(env.state.Hash, env.rows(), mutations) != senderState.Hash || waWebLTHashByPlaintextIndex(env.state.Hash, env.rows(), mutations) != senderState.Hash {
+				t.Fatal("LID contact patch does not match both WA Web hash models")
+			}
+		})
+	}
 }
 
 func (env *contactWriteEnv) rows() []waWebRow {
