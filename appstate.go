@@ -112,6 +112,9 @@ func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WA
 	hasMore := true
 	wantSnapshot := fullSync
 	var eventsToDispatch []any
+	if fullSync {
+		eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncStart{Name: name})
+	}
 	eventsToDispatchPtr := &eventsToDispatch
 	if fullSync && !cli.EmitAppStateEventsOnFullSync {
 		eventsToDispatchPtr = nil
@@ -198,6 +201,7 @@ func (cli *Client) handleAppStateRecovery(
 	if !ok {
 		return true
 	}
+	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncStart{Name: name, Recovery: true})
 	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
 	if err != nil {
 		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
@@ -253,7 +257,7 @@ func (cli *Client) collectEventsToDispatch(
 	}
 	for _, mutation := range mutations {
 		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
-			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
+			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action, FromFullSync: fullSync})
 		}
 		evt := cli.dispatchAppState(ctx, name, mutation, fullSync)
 		if eventsToDispatch != nil && evt != nil {

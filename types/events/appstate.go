@@ -179,7 +179,17 @@ type LabelAssociationMessage struct {
 // You should generally use the higher-level events like events.Contact and events.Mute.
 type AppState struct {
 	Index []string
+	// FromFullSync also covers recovery snapshots. Generic actions (including
+	// quick replies) need the same provenance as their typed counterparts.
+	FromFullSync bool
 	*waSyncAction.SyncActionValue
+}
+
+// AppStateSyncStart precedes every mutation of a full or recovery snapshot in
+// its ordered event batch. Incremental deltas do not emit this boundary.
+type AppStateSyncStart struct {
+	Name     appstate.WAPatchName
+	Recovery bool
 }
 
 // AppStateSyncComplete is emitted when app state is resynced.
