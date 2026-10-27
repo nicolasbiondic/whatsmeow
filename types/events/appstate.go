@@ -197,6 +197,9 @@ type AppStateSyncComplete struct {
 	Name     appstate.WAPatchName
 	Version  uint64
 	Recovery bool
+	// Failed closes an opening after rejected recovery dispatch. Consumers must
+	// invalidate partial data, not mark it complete; Version is not certified.
+	Failed bool
 }
 
 type AppStateSyncError struct {

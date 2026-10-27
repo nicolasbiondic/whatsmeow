@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -208,14 +209,53 @@ func (cli *Client) handleAppStateRecovery(
 		return true
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
-	for _, evt := range eventsToDispatch {
-		handlerFailed := cli.dispatchEvent(evt)
-		if handlerFailed {
-			return false
-		}
+	if cli.dispatchAppStateRecovery(eventsToDispatch) {
+		return false
 	}
 	cli.Log.Debugf("Finished handling app state recovery response for %s (%s to v%d)", reqID, name, version)
 	return true
+}
+
+// Keep the handler set stable through the recovery batch, and close only those
+// openings whose recipients did not accept a successful close. Cleanup is a
+// FAILED boundary, never a certificate that a rejected partial batch completed.
+func (cli *Client) dispatchAppStateRecovery(batch []any) (handlerFailed bool) {
+	cli.eventHandlersLock.RLock()
+	defer cli.eventHandlersLock.RUnlock()
+	open := make([]*events.AppStateSyncStart, len(cli.eventHandlers))
+	defer func() {
+		if err := recover(); err != nil {
+			handlerFailed = true
+			cli.Log.Errorf("Event handler panicked in app state recovery: %v\n%s", err, debug.Stack())
+		}
+		for i, start := range open {
+			if start == nil {
+				continue
+			}
+			func() {
+				defer func() {
+					if err := recover(); err != nil {
+						cli.Log.Errorf("Event handler panicked closing failed app state recovery: %v", err)
+					}
+				}()
+				cli.eventHandlers[i].fn(&events.AppStateSyncComplete{Name: start.Name, Recovery: true, Failed: true})
+			}()
+		}
+	}()
+	for _, evt := range batch {
+		for i, handler := range cli.eventHandlers {
+			if start, ok := evt.(*events.AppStateSyncStart); ok {
+				open[i] = start
+			}
+			if !handler.fn(evt) {
+				return true
+			}
+			if _, complete := evt.(*events.AppStateSyncComplete); complete {
+				open[i] = nil
+			}
+		}
+	}
+	return false
 }
 
 func (cli *Client) applyAppStatePatches(
@@ -768,8 +808,20 @@ func (cli *Client) applyAppStateConflicts(ctx context.Context, name appstate.WAP
 		return nil, nil
 	}
 	var eventsToDispatch []any
+	if pending.Snapshot != nil {
+		eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncStart{Name: name})
+		state, err = cli.applyAppStatePatches(ctx, name, state, &appstate.PatchList{Name: name, Snapshot: pending.Snapshot}, true, &eventsToDispatch)
+		if err != nil {
+			return nil, err
+		}
+		eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: state.Version})
+		pending.Snapshot = nil
+	}
 	_, err = cli.applyAppStatePatches(ctx, name, state, &pending, false, &eventsToDispatch)
-	return eventsToDispatch, err
+	if err != nil {
+		return nil, err
+	}
+	return eventsToDispatch, nil
 }
 
 func (cli *Client) MarkNotDirty(ctx context.Context, cleanType string, ts time.Time) error {
