@@ -12,6 +12,8 @@
 // This fork therefore applies a patch whose snapshot MAC does not verify with
 // the locally computed hash, as WhatsApp Web does, when:
 //
+//   - upstream's continuity checks pass (the next version, with a non-empty
+//     local hash unless this is version 1), and
 //   - the collection is one of the chat-state collections below, and
 //   - the author is a companion (non-zero device index, not flagged as sent
 //     by the primary), or the author is the primary AND the collection is

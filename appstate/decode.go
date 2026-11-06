@@ -152,7 +152,7 @@ func (proc *Processor) decodeMutation(
 	if validateMACs {
 		expectedValueMAC := generateContentMAC(mutation.GetOperation(), content, keyID, keys.ValueMAC)
 		if !hmac.Equal(expectedValueMAC, valueMAC) {
-			err = fmt.Errorf("failed to verify mutation #%d: %w", i+1, ErrMismatchingContentMAC)
+			err = fmt.Errorf("failed to verify mutation #%d with key %X: %w", i+1, keyID, ErrMismatchingContentMAC)
 			return
 		}
 	}
@@ -172,7 +172,7 @@ func (proc *Processor) decodeMutation(
 	if validateMACs {
 		expectedIndexMAC := concatAndHMAC(sha256.New, keys.Index, syncAction.Index)
 		if !hmac.Equal(expectedIndexMAC, indexMAC) {
-			err = fmt.Errorf("failed to verify mutation #%d: %w", i+1, ErrMismatchingIndexMAC)
+			err = fmt.Errorf("failed to verify mutation #%d with key %X: %w", i+1, keyID, ErrMismatchingIndexMAC)
 			return
 		}
 	}
@@ -389,18 +389,15 @@ func (proc *Processor) validatePatch(
 	if validateMACs {
 		var keys ExpandedAppStateKeys
 		keys, err = proc.validateSnapshotMAC(ctx, patchName, newState, patch.GetKeyID().GetID(), patch.GetSnapshotMAC())
-		author := authorOf(patch)
-		tolerated := false
-		if err != nil && errors.Is(err, ErrMismatchingLTHash) && companionToleranceEnabled(patchName) &&
-			(!author.primary || proc.isCollectionLIDMigratedForDecode(ctx, patchName)) {
-			// The author signed this patch with its own diverged hash (see
-			// companion.go). Apply it with the local hash, as WhatsApp Web
-			// does, provided the patch MAC below verifies. For the primary
-			// this is only done on LID-migrated collections.
-			tolerated = true
-			err = nil
+		ltHashMismatch := errors.Is(err, ErrMismatchingLTHash)
+		if err != nil && !ltHashMismatch {
+			return
 		}
-		if err != nil && errors.Is(err, ErrMismatchingLTHash) {
+		author := authorOf(patch)
+		// Keep the fork's narrower eligibility policy around upstream's
+		// patch-MAC tolerance: only chat-state companions or migrated primaries.
+		if ltHashMismatch && (!companionToleranceEnabled(patchName) ||
+			(author.primary && !proc.isCollectionLIDMigratedForDecode(ctx, patchName))) {
 			// Not tolerated: attempt the mapping-free LID migration recovery
 			// (see lidrecovery.go). The recovered state is only accepted if
 			// the snapshot MAC verifies after subtracting the orphan
@@ -409,19 +406,27 @@ func (proc *Processor) validatePatch(
 			if ok {
 				newState = fixedState
 				recoveredOrphans = orphans
+				ltHashMismatch = false
 				err = nil
+			} else {
+				proc.noteFailedPatch(patchName, version, author, err)
+				return
 			}
 		}
-		if err != nil {
+		// Like WhatsApp Web, only ignore the mismatch if local state isn't obviously missing.
+		// A skipped version or an empty hash means a full sync is needed.
+		if ltHashMismatch && (version != currentState.Version+1 || (currentState.Hash == [128]byte{} && version != 1)) {
 			proc.noteFailedPatch(patchName, version, author, err)
 			return
 		}
+		err = nil
 		patchMAC := generatePatchMAC(patch, patchName, keys.PatchMAC, patch.GetVersion().GetVersion())
 		if !hmac.Equal(patchMAC, patch.GetPatchMAC()) {
 			err = fmt.Errorf("failed to verify patch v%d: %w", version, ErrMismatchingPatchMAC)
 			return
 		}
-		if tolerated {
+		if ltHashMismatch {
+			proc.Log.Warnf("Ignoring mismatching LTHash in %s v%d as patch MAC is valid (warnings: %+v)", patchName, version, warn)
 			proc.noteToleratedPatch(patchName, version, author)
 		} else {
 			proc.noteVerifiedPatch(patchName, version, author)

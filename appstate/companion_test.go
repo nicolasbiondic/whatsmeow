@@ -188,6 +188,77 @@ func TestCompanionToleranceOnlyCoversChatStateCollections(t *testing.T) {
 	}
 }
 
+// Upstream #1319 must not turn tolerance into a substitute for missing state.
+func TestPatchToleranceRequiresContinuousState(t *testing.T) {
+	t.Setenv(companionToleranceEnvVar, "")
+	for _, device := range []uint32{0, 25} {
+		for _, scenario := range []string{"next", "gap", "duplicate", "empty_hash", "first"} {
+			t.Run(strconv.Itoa(int(device))+"/"+scenario, func(t *testing.T) {
+				env := newLIDWriteEnv(t, true)
+				local := env.state
+				if scenario == "empty_hash" || scenario == "first" {
+					local.Hash = [128]byte{}
+				}
+				if scenario == "first" {
+					local.Version = 0
+				}
+				authorState := local
+				authorState.Hash[0] ^= 0xff
+				switch scenario {
+				case "gap":
+					authorState.Version++
+				case "duplicate":
+					authorState.Version--
+				}
+				patch := encodeTestPatch(t, env, authorState, BuildArchive(freshChat("100000000000003"), true, time.Now(), nil), device)
+				list := &PatchList{Name: WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{patch}}
+				mutations, got, err := env.proc.DecodePatches(t.Context(), list, local, true)
+				if scenario == "next" || scenario == "first" {
+					if err != nil || got != stateAfter(t, local, patch) {
+						t.Fatalf("continuous patch: state=%+v err=%v", got, err)
+					}
+					return
+				}
+				if !errors.Is(err, ErrMismatchingLTHash) || got != local || len(mutations) != 0 {
+					t.Fatalf("missing state accepted: state=%+v mutations=%d err=%v", got, len(mutations), err)
+				}
+				version, hash, err := env.appState.GetAppStateVersion(t.Context(), string(list.Name))
+				if err != nil || version != env.state.Version || hash != env.state.Hash {
+					t.Fatalf("rejected patch changed stored state: v%d err=%v", version, err)
+				}
+				if env.proc.toleratedStreak[list.Name] != 0 {
+					t.Fatal("rejected patch recorded as tolerated")
+				}
+			})
+		}
+	}
+}
+
+func TestToleratedPatchStillVerifiesMutationMACs(t *testing.T) {
+	t.Setenv(companionToleranceEnvVar, "")
+	for _, kind := range []string{"content", "index"} {
+		t.Run(kind, func(t *testing.T) {
+			env := newLIDWriteEnv(t, true)
+			patch, _, _ := companionScenario(t, env, WAPatchRegularLow, 25)
+			wantErr := ErrMismatchingContentMAC
+			if kind == "content" {
+				patch.Mutations[0].Record.Value.Blob[0] ^= 1
+			} else {
+				patch.Mutations[0].Record.Index.Blob[0] ^= 1
+				wantErr = ErrMismatchingIndexMAC
+			}
+			list := &PatchList{Name: WAPatchRegularLow, Patches: []*waServerSync.SyncdPatch{patch}}
+			if _, _, err := env.proc.DecodePatches(t.Context(), list, env.state, true); !errors.Is(err, wantErr) {
+				t.Fatalf("invalid %s MAC: err=%v, want %v", kind, err, wantErr)
+			}
+			version, hash, err := env.appState.GetAppStateVersion(t.Context(), string(list.Name))
+			if err != nil || version != env.state.Version || hash != env.state.Hash {
+				t.Fatalf("invalid mutation changed stored state: v%d err=%v", version, err)
+			}
+		})
+	}
+}
+
 // Real data from line 964 on 2026-10-12: local state v1655, then two
 // WhatsApp Web patches (device 25) with their own diverged hash interleaved
 // with primary patches, the last one under a rotated key.

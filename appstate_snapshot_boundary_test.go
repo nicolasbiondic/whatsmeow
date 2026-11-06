@@ -216,3 +216,40 @@ func TestRecoverySnapshotStartsBeforeCompletion(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoveryAdoptsSameVersionButNotOlder(t *testing.T) {
+	for _, currentVersion := range []uint64{1, 2} {
+		t.Run(fmt.Sprint(currentVersion), func(t *testing.T) {
+			device := newMemAppStateDevice(t)
+			cli := NewClient(device, nil)
+			name := string(appstate.WAPatchRegularLow)
+			oldHash := [128]byte{1}
+			if err := device.AppState.PutAppStateVersion(t.Context(), name, currentVersion, oldHash); err != nil {
+				t.Fatal(err)
+			}
+			recoveredHash := [128]byte{2}
+			snapshot, err := proto.Marshal(&waSyncdSnapshotRecovery.SyncdSnapshotRecovery{
+				CollectionName:   proto.String(name),
+				CollectionLthash: recoveredHash[:],
+				Version:          &waSyncdSnapshotRecovery.SyncdVersion{Version: proto.Uint64(1)},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult{{
+				SyncdSnapshotFatalRecoveryResponse: &waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult_SyncDSnapshotFatalRecoveryResponse{CollectionSnapshot: snapshot},
+			}}
+			if !cli.handleAppStateRecovery(t.Context(), "synthetic-recovery", result) {
+				t.Fatal("recovery handler failed")
+			}
+			version, hash, err := device.AppState.GetAppStateVersion(t.Context(), name)
+			wantHash := recoveredHash
+			if currentVersion > 1 {
+				wantHash = oldHash
+			}
+			if err != nil || version != currentVersion || hash != wantHash {
+				t.Fatalf("recovery state: v%d hash=%x err=%v", version, hash, err)
+			}
+		})
+	}
+}

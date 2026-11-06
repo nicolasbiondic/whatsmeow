@@ -3,13 +3,16 @@ package whatsmeow
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 )
@@ -19,6 +22,46 @@ import (
 // regular_low collection (v1650) can only come from a phone recovery. The
 // test is skipped when the copy is not present.
 const fixcheckSessionDB = "/tmp/opencode/syncd-research/data/fixcheck/session.db"
+
+func TestFullSyncBackoffBeforeStoreAccess(t *testing.T) {
+	// No store is installed: a rate-limited fetch must return before capture
+	// or deletion, regardless of the full-sync request.
+	cli := NewClient(&store.Device{}, nil)
+	cli.appStateBackoff[appstate.WAPatchRegularLow] = time.Now().Add(time.Hour)
+	for _, fullSync := range []bool{false, true} {
+		if err := cli.FetchAppState(t.Context(), appstate.WAPatchRegularLow, fullSync, false); !errors.Is(err, ErrAppStateRateLimited) {
+			t.Fatalf("fullSync=%t: err=%v, want ErrAppStateRateLimited", fullSync, err)
+		}
+	}
+}
+
+func TestFailedFullSyncRestoresSyntheticState(t *testing.T) {
+	device := newMemAppStateDevice(t)
+	cli := NewClient(device, nil)
+	name := string(appstate.WAPatchRegularLow)
+	hash := [128]byte{1, 2, 3}
+	if err := device.AppState.PutAppStateVersion(t.Context(), name, 100, hash); err != nil {
+		t.Fatal(err)
+	}
+	macs := []store.AppStateMutationMAC{{IndexMAC: make([]byte, 32), ValueMAC: []byte{4, 5, 6}}}
+	if err := device.AppState.PutAppStateMutationMACs(t.Context(), name, 100, macs); err != nil {
+		t.Fatal(err)
+	}
+	// An expired backoff must allow the fetch; with no socket it fails after
+	// reset and exercises the real capture/restore path without any session DB.
+	cli.appStateBackoff[appstate.WAPatchRegularLow] = time.Now().Add(-time.Hour)
+	if err := cli.FetchAppState(t.Context(), appstate.WAPatchRegularLow, true, false); !errors.Is(err, ErrNotConnected) {
+		t.Fatalf("disconnected full sync: err=%v, want ErrNotConnected", err)
+	}
+	version, gotHash, err := device.AppState.GetAppStateVersion(t.Context(), name)
+	if err != nil || version != 100 || gotHash != hash {
+		t.Fatalf("full sync lost state: v%d hash=%x err=%v", version, gotHash, err)
+	}
+	gotMAC, err := device.AppState.GetAppStateMutationMAC(t.Context(), name, macs[0].IndexMAC)
+	if err != nil || string(gotMAC) != string(macs[0].ValueMAC) {
+		t.Fatalf("full sync lost MAC: %x err=%v", gotMAC, err)
+	}
+}
 
 func TestCaptureAndRestoreAppStateVersion(t *testing.T) {
 	if _, err := os.Stat(fixcheckSessionDB); err != nil {

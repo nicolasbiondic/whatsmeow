@@ -87,6 +87,8 @@ type Client struct {
 	SynchronousAck             bool
 	EnableDecryptedEventBuffer bool
 	lastDecryptedBufferClear   time.Time
+	lastUnifiedSessionSend     time.Time
+	UnifiedSessionInterval     time.Duration
 
 	DisableLoginAutoReconnect bool
 
@@ -103,6 +105,7 @@ type Client struct {
 
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
+	appStateBackoff  map[appstate.WAPatchName]time.Time
 	// appStateRecoveryLock serializes the short app-state store write sections
 	// of a recovery response (handleAppStateRecovery → ProcessRecovery) with a
 	// full sync's capture/delete and restore (fetchAppState), so a restore
@@ -306,6 +309,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		sessionRecreateHistory: make(map[types.JID]time.Time),
 		GetMessageForRetry:     func(requester, to types.JID, id types.MessageID) *waE2E.Message { return nil },
 		appStateKeyRequests:    make(map[string]time.Time),
+		appStateBackoff:        make(map[appstate.WAPatchName]time.Time),
 
 		pendingPhoneRerequests: make(map[types.MessageID]context.CancelFunc),
 
@@ -538,7 +542,9 @@ func isRetryableConnectError(err error) bool {
 		}
 	}
 
-	return errors.Is(err, socket.ErrDialFailed)
+	return errors.Is(err, socket.ErrDialFailed) ||
+		errors.Is(err, ErrHandshakeTimeout) ||
+		errors.Is(err, socket.ErrSocketClosed)
 }
 
 func (cli *Client) ConnectContext(ctx context.Context) error {
@@ -1113,11 +1119,14 @@ func (cli *Client) getUnifiedSessionID() string {
 	return strconv.FormatInt(unifiedID, 10)
 }
 
-func (cli *Client) sendUnifiedSession() {
+func (cli *Client) sendUnifiedSession(checkLastSend bool) {
 	if cli == nil {
 		return
 	}
-
+	if checkLastSend && time.Since(cli.lastUnifiedSessionSend) < cli.UnifiedSessionInterval {
+		return
+	}
+	cli.lastUnifiedSessionSend = time.Now()
 	node := waBinary.Node{
 		Tag:   "ib",
 		Attrs: waBinary.Attrs{},
