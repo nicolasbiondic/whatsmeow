@@ -47,6 +47,15 @@ func (int *DangerousInternalClient) FetchAppState(ctx context.Context, name apps
 	return int.c.fetchAppState(ctx, name, fullSync, onlyIfNotSynced)
 }
 
+// FetchAppStateOrdered is FetchAppState for callers that apply the events
+// themselves and need them at their place in the collection's commit order:
+// deliver receives the events after every batch of that collection that was
+// committed earlier has been dispatched, and before any later one is. It may
+// run on another goroutine after this returns, and must not block.
+func (int *DangerousInternalClient) FetchAppStateOrdered(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool, deliver func([]any)) error {
+	return int.c.fetchAppStateOrdered(ctx, name, fullSync, onlyIfNotSynced, deliver)
+}
+
 func (int *DangerousInternalClient) HandleAppStateRecovery(ctx context.Context, reqID types.MessageID, result []*waE2E.PeerDataOperationRequestResponseMessage_PeerDataOperationResult) bool {
 	return int.c.handleAppStateRecovery(ctx, reqID, result)
 }

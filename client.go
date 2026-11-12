@@ -109,6 +109,7 @@ type Client struct {
 	// Per-collection locks serialize patch persistence, recovery adoption and
 	// full-sync capture/reset/restore, without holding a lock during downloads.
 	appStateRecoveryLocks sync.Map
+	appStatePublisher     appStatePublisher
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool
@@ -318,6 +319,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		WebSocketHeaders: http.Header{},
 	}
 	cli.appStateProc.CollectionLock = cli.appStateCollectionLock
+	cli.appStateProc.OnCommit = cli.noteAppStateCommit
 	cli.paired.Store(deviceStore.ID != nil)
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,

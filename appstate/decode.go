@@ -245,6 +245,7 @@ func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, previous
 		if err != nil {
 			return fmt.Errorf("failed to store app state patch in the database: %w", err)
 		}
+		proc.noteCommit(ctx, name)
 		return nil
 	}
 	err := proc.Store.AppState.PutAppStateVersion(ctx, string(name), currentState.Version, currentState.Hash)
@@ -259,7 +260,14 @@ func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, previous
 	if err != nil {
 		return fmt.Errorf("failed to insert added mutation MACs to the database: %w", err)
 	}
+	proc.noteCommit(ctx, name)
 	return nil
+}
+
+func (proc *Processor) noteCommit(ctx context.Context, name WAPatchName) {
+	if proc.OnCommit != nil {
+		proc.OnCommit(ctx, name)
+	}
 }
 
 func (proc *Processor) validateSnapshotMAC(ctx context.Context, name WAPatchName, currentState HashState, keyID, expectedSnapshotMAC []byte) (keys ExpandedAppStateKeys, err error) {

@@ -160,6 +160,10 @@ type Processor struct {
 	// CollectionLock, when set, serializes patch persistence with external
 	// recovery/reset writes and checks that the decoded base is still current.
 	CollectionLock func(WAPatchName) sync.Locker
+	// OnCommit, when set, runs right after a patch or snapshot was persisted,
+	// still under the collection lock, so callers can record the commit order.
+	// It must not block or call back into the processor.
+	OnCommit func(context.Context, WAPatchName)
 
 	// lidMigratedCache caches positive "this collection has LID-indexed chat
 	// entries" results per collection (see lidwrite.go). Only true is cached:

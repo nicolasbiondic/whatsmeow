@@ -627,7 +627,9 @@ func (s *SQLStore) PutAppStatePatch(ctx context.Context, name string, version ui
 		if err := s.PutAppStateMutationMACs(ctx, name, version, addedMACs); err != nil {
 			return err
 		}
-		_, err := s.db.Exec(ctx, deleteAppStateBackupQuery, s.JID, name)
+		// A verified prefix below the pre-reset cursor is not a complete
+		// replacement yet. Keep the old state recoverable across process death.
+		_, err := s.db.Exec(ctx, deleteAppStateBackupQuery+` AND version <= $3`, s.JID, name, version)
 		return err
 	})
 }

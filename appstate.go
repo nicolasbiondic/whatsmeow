@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,15 +31,64 @@ import (
 
 // FetchAppState fetches updates to the given type of app state. If fullSync is true, the current
 // cached state will be removed and all app state patches will be re-fetched from the server.
+//
+// The events of a collection are dispatched in the order its batches were committed. When an
+// earlier batch of the same collection is still being dispatched (including when this is called
+// from one of its event handlers), this returns once the state is stored, and the goroutine
+// dispatching that earlier batch delivers these events right after it.
 func (cli *Client) FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
-	eventsToDispatch, err := cli.fetchAppState(ctx, name, fullSync, onlyIfNotSynced)
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
 	if err != nil {
 		return err
 	}
-	for _, evt := range eventsToDispatch {
-		cli.dispatchEvent(evt)
-	}
+	cli.dispatchAppStateBatch(batch, eventsToDispatch)
 	return nil
+}
+
+// fetchAppStateOrdered is FetchAppState, except that the events go to deliver
+// instead of the event handlers. deliver runs at the batch's place in the
+// collection's commit order, possibly on another goroutine after this returns.
+func (cli *Client) fetchAppStateOrdered(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool, deliver func([]any)) error {
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
+	if err != nil {
+		return err
+	}
+	cli.finishAppStateBatch(batch, func() { deliver(eventsToDispatch) })
+	return nil
+}
+
+// fetchAppState returns the events to its caller, who applies them itself:
+// the batch leaves the publication order when this returns.
+func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
+	if err != nil {
+		return nil, err
+	}
+	cli.finishAppStateBatch(batch, nil)
+	return eventsToDispatch, nil
+}
+
+// fetchAppStateBatch fetches a collection and returns its events together
+// with their place in the publication order. The caller must finish the
+// batch. A failed fetch gives its place up here, after the sync lock is
+// released, as that may publish batches that were queued behind it.
+func (cli *Client) fetchAppStateBatch(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) (*appStateBatch, []any, error) {
+	if cli == nil {
+		return nil, nil, ErrClientIsNil
+	}
+	ctx, batch := newAppStateBatch(ctx, name)
+	fetched := false
+	defer func() {
+		if !fetched {
+			cli.finishAppStateBatch(batch, nil)
+		}
+	}()
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
+	if err != nil {
+		return nil, nil, err
+	}
+	fetched = true
+	return batch, eventsToDispatch, nil
 }
 
 func (cli *Client) appStateCollectionLock(name appstate.WAPatchName) sync.Locker {
@@ -46,10 +96,7 @@ func (cli *Client) appStateCollectionLock(name appstate.WAPatchName) sync.Locker
 	return lock.(*sync.Mutex)
 }
 
-func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
-	if cli == nil {
-		return nil, ErrClientIsNil
-	}
+func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
 	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
@@ -93,6 +140,21 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		}
 	}
 	eventsToDispatch, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
+	if err == nil && backup != nil {
+		// A successful full replay may intentionally establish a lower cursor
+		// (server reset). Seal that complete state and retire the journal, while
+		// preserving any recovery that committed during the download.
+		collectionLock.Lock()
+		current, captureErr := captureAppStateVersion(ctx, cli.Store.AppState, string(name))
+		if captureErr != nil {
+			err = fmt.Errorf("capture completed app state %s: %w", name, captureErr)
+		} else if current == nil {
+			err = fmt.Errorf("full sync of app state %s completed without a verified state", name)
+		} else {
+			err = cli.Store.AppState.ReplaceAppStateVersion(ctx, string(name), current.Version, current.Hash, current.MACs)
+		}
+		collectionLock.Unlock()
+	}
 	if err != nil && backup != nil {
 		// Atomic check-then-restore: skip the restore when a recovery response
 		// adopted an equal-or-newer state while the full sync was downloading,
@@ -113,7 +175,10 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 			cli.Log.Warnf("Full sync of app state %s failed, restored previous local state (v%d): %v", name, backup.Version, err)
 		}
 	}
-	return eventsToDispatch, err
+	if err != nil {
+		return nil, err
+	}
+	return eventsToDispatch, nil
 }
 
 func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
@@ -197,6 +262,13 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
+	batch := &appStateBatch{name: name}
+	published := false
+	defer func() {
+		if !published {
+			cli.finishAppStateBatch(batch, nil)
+		}
+	}()
 	// The version check and the adoption write must be atomic with respect to
 	// a concurrent full sync's capture/delete and restore (fetchAppState), or
 	// the restore of a failed full sync could overwrite the adopted state.
@@ -205,6 +277,9 @@ func (cli *Client) handleAppStateRecovery(
 	// message-handling path, which must not stall for minutes. The lock is
 	// released before dispatching events, as handlers may fetch app state
 	// themselves (which takes appStateSyncLock, then the collection lock).
+	// The batch takes its place in the publication order before the lock is
+	// released, so a fetch that committed earlier cannot deliver its events
+	// after this snapshot's.
 	mutations, ok := func() ([]appstate.Mutation, bool) {
 		lock := cli.appStateCollectionLock(name)
 		lock.Lock()
@@ -223,6 +298,7 @@ func (cli *Client) handleAppStateRecovery(
 			cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 			return nil, false
 		}
+		cli.appStatePublisher.reserve(batch)
 		return mutations, true
 	}()
 	if !ok {
@@ -235,8 +311,25 @@ func (cli *Client) handleAppStateRecovery(
 		return true
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
-	if cli.dispatchAppStateRecovery(eventsToDispatch) {
+	// 0: still queued behind an earlier batch, 1: dispatched, 2: a handler failed.
+	var outcome atomic.Int32
+	published = true
+	cli.finishAppStateBatch(batch, func() {
+		if cli.dispatchAppStateRecovery(eventsToDispatch) {
+			outcome.Store(2)
+			cli.Log.Warnf("Event handler failed while dispatching app state recovery for %s (%s to v%d)", reqID, name, version)
+		} else {
+			outcome.Store(1)
+		}
+	})
+	switch outcome.Load() {
+	case 2:
 		return false
+	case 0:
+		// Its publisher delivers this snapshot next; waiting here could
+		// deadlock with a handler of that batch.
+		cli.Log.Debugf("App state recovery response for %s (%s to v%d) is stored; its events follow an earlier batch of the collection", reqID, name, version)
+		return true
 	}
 	cli.Log.Debugf("Finished handling app state recovery response for %s (%s to v%d)", reqID, name, version)
 	return true
@@ -766,16 +859,12 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
 			}
-			eventsToDispatch, err := cli.applyAppStateConflicts(ctx, patch.Type, patches)
+			batch, eventsToDispatch, err := cli.applyAppStateConflictBatch(ctx, patch.Type, patches)
 			if err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
-				go func() {
-					for _, evt := range eventsToDispatch {
-						cli.dispatchEvent(evt)
-					}
-				}()
+				go cli.dispatchAppStateBatch(batch, eventsToDispatch)
 				return cli.sendAppState(ctx, patch, false)
 			}
 		}
@@ -784,15 +873,11 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	// The server stored the patch at version+1; remember it so its echo is not
 	// counted as the primary confirming the local hash (appstate/companion.go).
 	cli.appStateProc.NoteOwnPatch(patch.Type, version+1)
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
-	go func() {
-		for _, evt := range eventsToDispatch {
-			cli.dispatchEvent(evt)
-		}
-	}()
+	go cli.dispatchAppStateBatch(batch, eventsToDispatch)
 
 	return nil
 }
@@ -810,6 +895,25 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 // values", so the old values are never subtracted from the LTHash, and the
 // MAC insert fails with a duplicate key.
 func (cli *Client) applyAppStateConflicts(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) ([]any, error) {
+	batch, eventsToDispatch, err := cli.applyAppStateConflictBatch(ctx, name, patches)
+	cli.finishAppStateBatch(batch, nil)
+	return eventsToDispatch, err
+}
+
+// applyAppStateConflictBatch is applyAppStateConflicts with the batch's place
+// in the publication order, which the caller must finish. As with fetches, a
+// failed batch gives its place up only after the sync lock is released.
+func (cli *Client) applyAppStateConflictBatch(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) (*appStateBatch, []any, error) {
+	ctx, batch := newAppStateBatch(ctx, name)
+	eventsToDispatch, err := cli.applyAppStateConflictsLocked(ctx, name, patches)
+	if err != nil {
+		cli.finishAppStateBatch(batch, nil)
+		return nil, nil, err
+	}
+	return batch, eventsToDispatch, nil
+}
+
+func (cli *Client) applyAppStateConflictsLocked(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) ([]any, error) {
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))

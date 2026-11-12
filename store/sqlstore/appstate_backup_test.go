@@ -69,7 +69,7 @@ func TestAppStateRestoreTransactionFailureAtomic(t *testing.T) {
 }
 
 func TestAppStateResetRestartRecoversVerifiedState(t *testing.T) {
-	for _, phase := range []string{"before_reset", "after_reset", "version_without_macs"} {
+	for _, phase := range []string{"before_reset", "after_reset", "version_without_macs", "verified_prefix", "completed_lower_reset"} {
 		t.Run(phase, func(t *testing.T) {
 			s := newTestAppStateStore(t)
 			hash, macs := seedResetBackup(t, s)
@@ -81,6 +81,16 @@ func TestAppStateResetRestartRecoversVerifiedState(t *testing.T) {
 			if phase == "version_without_macs" {
 				// Simulate an old writer interrupted in its multistatement restore.
 				if err := s.PutAppStateVersion(t.Context(), "regular", 100, hash); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if phase == "verified_prefix" || phase == "completed_lower_reset" {
+				if err := s.PutAppStatePatch(t.Context(), "regular", 50, hash, nil, macs); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if phase == "completed_lower_reset" {
+				if err := s.ReplaceAppStateVersion(t.Context(), "regular", 50, hash, macs); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -103,7 +113,19 @@ func TestAppStateResetRestartRecoversVerifiedState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertResetRecovered(t, NewSQLStore(c, jid), hash, macs)
+			reopened := NewSQLStore(c, jid)
+			if phase == "completed_lower_reset" {
+				version, gotHash, err := reopened.GetAppStateVersion(t.Context(), "regular")
+				if err != nil || version != 50 || gotHash != hash {
+					t.Fatalf("completed reset reverted on reopen: version=%d err=%v", version, err)
+				}
+				gotMACs, err := reopened.GetAllAppStateMutationMACs(t.Context(), "regular")
+				if err != nil || !reflect.DeepEqual(gotMACs, macs) {
+					t.Fatalf("completed reset MACs changed: %v", err)
+				}
+			} else {
+				assertResetRecovered(t, reopened, hash, macs)
+			}
 		})
 	}
 }
