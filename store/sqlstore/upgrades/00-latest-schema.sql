@@ -1,4 +1,4 @@
--- v0 -> v16 (compatible with v8+): Latest schema
+-- v0 -> v17 (compatible with v8+): Latest schema
 CREATE TABLE whatsmeow_device (
 	jid TEXT PRIMARY KEY,
 	lid TEXT,
@@ -84,6 +84,16 @@ CREATE TABLE whatsmeow_app_state_version (
 	version BIGINT NOT NULL,
 	hash    bytea  NOT NULL CHECK ( length(hash) = 128 ),
 
+	PRIMARY KEY (jid, name),
+	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE whatsmeow_app_state_backup (
+	jid TEXT NOT NULL,
+	name TEXT NOT NULL,
+	version BIGINT NOT NULL,
+	hash bytea NOT NULL CHECK ( length(hash) = 128 ),
+	macs bytea NOT NULL,
 	PRIMARY KEY (jid, name),
 	FOREIGN KEY (jid) REFERENCES whatsmeow_device(jid) ON DELETE CASCADE ON UPDATE CASCADE
 );

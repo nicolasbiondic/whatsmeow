@@ -51,6 +51,7 @@ type SQLStore struct {
 	contactCacheLock sync.Mutex
 
 	migratedPNSessionsCache *exsync.Set[string]
+	appStateRecoveryChecks  sync.Map
 }
 
 // NewSQLStore creates a new SQLStore with the given database container and user JID.
@@ -527,6 +528,13 @@ func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version 
 }
 
 func (s *SQLStore) GetAppStateVersion(ctx context.Context, name string) (version uint64, hash [128]byte, err error) {
+	if err = s.recoverAppStateBackup(ctx, name); err != nil {
+		return
+	}
+	return s.getAppStateVersion(ctx, name)
+}
+
+func (s *SQLStore) getAppStateVersion(ctx context.Context, name string) (version uint64, hash [128]byte, err error) {
 	var uncheckedHash []byte
 	err = s.db.QueryRow(ctx, getAppStateVersionQuery, s.JID, name).Scan(&version, &uncheckedHash)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -616,7 +624,11 @@ func (s *SQLStore) PutAppStatePatch(ctx context.Context, name string, version ui
 		} else if err = s.DeleteAppStateMutationMACs(ctx, name, removedIndexMACs); err != nil {
 			return err
 		}
-		return s.PutAppStateMutationMACs(ctx, name, version, addedMACs)
+		if err := s.PutAppStateMutationMACs(ctx, name, version, addedMACs); err != nil {
+			return err
+		}
+		_, err := s.db.Exec(ctx, deleteAppStateBackupQuery, s.JID, name)
+		return err
 	})
 }
 

@@ -367,6 +367,18 @@ func (proc *Processor) validatePatch(
 	currentState HashState,
 	validateMACs bool,
 ) (newState HashState, recoveredOrphans []store.AppStateMutationMAC, warn []error, err error) {
+	// MAC lookups can overlap a recovery that replaces the collection. A
+	// validation failure only describes corruption if the decoded base is
+	// still current. Do not classify transport, key lookup or database errors
+	// as stale, and do not rely on error text.
+	defer func() {
+		if !errors.Is(err, ErrMismatchingLTHash) && !errors.Is(err, ErrMismatchingPatchMAC) {
+			return
+		}
+		if stateErr := proc.checkDecodeBase(ctx, patchName, currentState); stateErr != nil {
+			err = stateErr
+		}
+	}()
 	version := patch.GetVersion().GetVersion()
 	newState = currentState
 	newState.Version = version
@@ -395,6 +407,12 @@ func (proc *Processor) validatePatch(
 	})
 	if err != nil {
 		err = fmt.Errorf("failed to update state hash: %w", err)
+		return
+	}
+
+	// Check before tolerance/recovery bookkeeping as well as on error: those
+	// paths must not record a superseded response as a broken collection.
+	if err = proc.checkDecodeBase(ctx, patchName, currentState); err != nil {
 		return
 	}
 
@@ -445,6 +463,23 @@ func (proc *Processor) validatePatch(
 		}
 	}
 	return
+}
+
+func (proc *Processor) checkDecodeBase(ctx context.Context, name WAPatchName, base HashState) error {
+	if proc.CollectionLock == nil {
+		return nil
+	}
+	lock := proc.CollectionLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+	version, hash, err := proc.Store.AppState.GetAppStateVersion(ctx, string(name))
+	if err != nil {
+		return fmt.Errorf("failed to recheck app state decode base: %w", err)
+	}
+	if version != base.Version || hash != base.Hash {
+		return fmt.Errorf("%w: %s decoded from v%d, stored v%d", ErrStateChanged, name, base.Version, version)
+	}
+	return nil
 }
 
 // DecodePatches will decode all the patches in a PatchList into a list of app state mutations.

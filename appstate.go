@@ -72,14 +72,19 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 			var captureErr error
 			backup, captureErr = captureAppStateVersion(ctx, cli.Store.AppState, string(name))
 			if captureErr != nil {
-				cli.Log.Warnf("Failed to capture app state %s before full sync (falling back to destructive resync): %v", name, captureErr)
-				backup = nil
+				deleteErr = fmt.Errorf("capture verified state: %w", captureErr)
+				return
 			} else if backup == nil {
 				// The capture found NO prior state at all (nil, nil): this
 				// full sync may bootstrap from a snapshot whose MAC does not
 				// verify (see appstate/bootstrap.go). A capture ERROR must
 				// never enable this, hence the else-if.
 				ctx = appstate.WithSnapshotBootstrap(ctx)
+			}
+			if backup != nil {
+				if deleteErr = cli.Store.AppState.PutAppStateBackup(ctx, string(name), backup.Version, backup.Hash, backup.MACs); deleteErr != nil {
+					return
+				}
 			}
 			deleteErr = cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		}()
@@ -101,6 +106,7 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		collectionLock.Unlock()
 		if restoreErr != nil {
 			cli.Log.Errorf("Failed to restore app state %s v%d after failed full sync: %v", name, backup.Version, restoreErr)
+			err = errors.Join(err, fmt.Errorf("failed to restore app state %s: %w", name, restoreErr))
 		} else if !restored {
 			cli.Log.Infof("Full sync of app state %s failed, but local state is already at v%d or newer (likely a recovery response); not restoring the captured copy: %v", name, backup.Version, err)
 		} else {

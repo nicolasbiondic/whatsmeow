@@ -72,6 +72,13 @@ type AppStateMutationMAC struct {
 }
 
 type AppStateStore interface {
+	// PutAppStateBackup durably preserves the verified state before a reset.
+	// Implementations must recover an unfinished reset before exposing state
+	// after reopening the store.
+	PutAppStateBackup(ctx context.Context, name string, version uint64, hash [128]byte, macs []AppStateMutationMAC) error
+	// ReplaceAppStateVersion atomically replaces the complete collection and
+	// retires its reset backup only when the replacement commits.
+	ReplaceAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte, macs []AppStateMutationMAC) error
 	PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error
 	GetAppStateVersion(ctx context.Context, name string) (uint64, [128]byte, error)
 	DeleteAppStateVersion(ctx context.Context, name string) error

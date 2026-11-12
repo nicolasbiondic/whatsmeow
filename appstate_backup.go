@@ -76,18 +76,8 @@ func restoreAppStateVersion(ctx context.Context, s store.AppStateStore, name str
 	if backup == nil {
 		return nil
 	}
-	// Drop any partial state stored by the failed sync (the version row
-	// cascades to its mutation MACs).
-	if err := s.DeleteAppStateVersion(ctx, name); err != nil {
-		return fmt.Errorf("delete partial app state: %w", err)
-	}
-	if err := s.PutAppStateVersion(ctx, name, backup.Version, backup.Hash); err != nil {
-		return fmt.Errorf("restore app state version: %w", err)
-	}
-	if len(backup.MACs) > 0 {
-		if err := s.PutAppStateMutationMACs(ctx, name, backup.Version, backup.MACs); err != nil {
-			return fmt.Errorf("restore app state mutation MACs: %w", err)
-		}
+	if err := s.ReplaceAppStateVersion(ctx, name, backup.Version, backup.Hash, backup.MACs); err != nil {
+		return fmt.Errorf("restore complete app state: %w", err)
 	}
 	return nil
 }
