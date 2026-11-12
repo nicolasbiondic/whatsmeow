@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -40,6 +41,11 @@ func (cli *Client) FetchAppState(ctx context.Context, name appstate.WAPatchName,
 	return nil
 }
 
+func (cli *Client) appStateCollectionLock(name appstate.WAPatchName) sync.Locker {
+	lock, _ := cli.appStateRecoveryLocks.LoadOrStore(name, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
 func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	if cli == nil {
 		return nil, ErrClientIsNil
@@ -50,18 +56,19 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
 	}
 	var backup *appStateVersionBackup
+	collectionLock := cli.appStateCollectionLock(name)
 	if fullSync {
 		// Capture the current verified state so a failed full sync can put it
 		// back instead of leaving the collection empty. Without this, accounts
 		// whose full sync can never verify (e.g. after a PN→LID migration on
 		// the primary) lose a previously adopted good state on every resync.
 		// The capture+delete pair is atomic with respect to recovery writes
-		// (appStateRecoveryLock), so the captured copy cannot miss a recovery
+		// (the collection lock), so the captured copy cannot miss a recovery
 		// adopted in between.
 		var deleteErr error
 		func() {
-			cli.appStateRecoveryLock.Lock()
-			defer cli.appStateRecoveryLock.Unlock()
+			collectionLock.Lock()
+			defer collectionLock.Unlock()
 			var captureErr error
 			backup, captureErr = captureAppStateVersion(ctx, cli.Store.AppState, string(name))
 			if captureErr != nil {
@@ -86,9 +93,12 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 		// adopted an equal-or-newer state while the full sync was downloading,
 		// instead of regressing it to the captured copy (and diverging from
 		// what the caller already persisted from the recovery's events).
-		cli.appStateRecoveryLock.Lock()
-		restored, restoreErr := restoreAppStateVersionIfOlder(ctx, cli.Store.AppState, string(name), backup)
-		cli.appStateRecoveryLock.Unlock()
+		collectionLock.Lock()
+		// Rollback must survive cancellation of the sync, but remain bounded.
+		restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		restored, restoreErr := restoreAppStateVersionIfOlder(restoreCtx, cli.Store.AppState, string(name), backup)
+		cancelRestore()
+		collectionLock.Unlock()
 		if restoreErr != nil {
 			cli.Log.Errorf("Failed to restore app state %s v%d after failed full sync: %v", name, backup.Version, restoreErr)
 		} else if !restored {
@@ -188,10 +198,11 @@ func (cli *Client) handleAppStateRecovery(
 	// the whole full sync (download included), and this code runs on the
 	// message-handling path, which must not stall for minutes. The lock is
 	// released before dispatching events, as handlers may fetch app state
-	// themselves (which takes appStateSyncLock, then appStateRecoveryLock).
+	// themselves (which takes appStateSyncLock, then the collection lock).
 	mutations, ok := func() ([]appstate.Mutation, bool) {
-		cli.appStateRecoveryLock.Lock()
-		defer cli.appStateRecoveryLock.Unlock()
+		lock := cli.appStateCollectionLock(name)
+		lock.Lock()
+		defer lock.Unlock()
 		currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 		if err != nil {
 			cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)

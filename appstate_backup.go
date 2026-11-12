@@ -55,7 +55,7 @@ func captureAppStateVersion(ctx context.Context, s store.AppStateStore, name str
 // back would regress it. Returns whether the backup was written.
 //
 // Callers must hold a lock that excludes concurrent recovery writes (the
-// client's appStateRecoveryLock) so the check-then-restore is atomic.
+// client's collection lock) so the check-then-restore is atomic.
 func restoreAppStateVersionIfOlder(ctx context.Context, s store.AppStateStore, name string, backup *appStateVersionBackup) (bool, error) {
 	if backup == nil {
 		return false, nil

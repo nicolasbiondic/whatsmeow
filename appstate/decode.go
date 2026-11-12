@@ -227,7 +227,19 @@ func (proc *Processor) decodeMutations(
 	return nil
 }
 
-func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
+func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, previousState, currentState HashState, out *patchOutput) error {
+	if proc.CollectionLock != nil {
+		lock := proc.CollectionLock(name)
+		lock.Lock()
+		defer lock.Unlock()
+		version, hash, err := proc.Store.AppState.GetAppStateVersion(ctx, string(name))
+		if err != nil {
+			return fmt.Errorf("failed to recheck app state version before persistence: %w", err)
+		}
+		if version != previousState.Version || hash != previousState.Hash || version >= currentState.Version {
+			return fmt.Errorf("%w: %s decoded from v%d to v%d, stored v%d", ErrStateChanged, name, previousState.Version, currentState.Version, version)
+		}
+	}
 	if txStore, ok := proc.Store.AppState.(store.AppStatePatchStore); ok {
 		err := txStore.PutAppStatePatch(ctx, string(name), currentState.Version, currentState.Hash, out.RemovedMACs, out.AddedMACs)
 		if err != nil {
@@ -340,7 +352,7 @@ func (proc *Processor) decodeSnapshot(
 			return
 		}
 	}
-	err = proc.storeMACs(ctx, name, currentState, &out)
+	err = proc.storeMACs(ctx, name, initialState, currentState, &out)
 	if err != nil {
 		return
 	}
@@ -487,7 +499,7 @@ func (proc *Processor) DecodePatches(
 		for _, orphan := range recoveredOrphans {
 			out.RemoveMAC(orphan.IndexMAC)
 		}
-		err = proc.storeMACs(ctx, list.Name, newState, &out)
+		err = proc.storeMACs(ctx, list.Name, currentState, newState, &out)
 		if err != nil {
 			return
 		}

@@ -16,4 +16,5 @@ var (
 	ErrMismatchingContentMAC            = errors.New("mismatching content MAC")
 	ErrMismatchingIndexMAC              = errors.New("mismatching index MAC")
 	ErrKeyNotFound                      = errors.New("didn't find app state key")
+	ErrStateChanged                     = errors.New("app state changed during decode")
 )

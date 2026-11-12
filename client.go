@@ -106,13 +106,9 @@ type Client struct {
 	appStateProc     *appstate.Processor
 	appStateSyncLock sync.Mutex
 	appStateBackoff  map[appstate.WAPatchName]time.Time
-	// appStateRecoveryLock serializes the short app-state store write sections
-	// of a recovery response (handleAppStateRecovery → ProcessRecovery) with a
-	// full sync's capture/delete and restore (fetchAppState), so a restore
-	// cannot overwrite a recovery adopted mid-sync. It is deliberately NOT
-	// appStateSyncLock: the recovery response arrives on the message-handling
-	// path, which must not block for the duration of a whole full sync.
-	appStateRecoveryLock sync.Mutex
+	// Per-collection locks serialize patch persistence, recovery adoption and
+	// full-sync capture/reset/restore, without holding a lock during downloads.
+	appStateRecoveryLocks sync.Map
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool
@@ -321,6 +317,7 @@ func NewClient(deviceStore *store.Device, log waLog.Logger) *Client {
 		UserAgent:        "",
 		WebSocketHeaders: http.Header{},
 	}
+	cli.appStateProc.CollectionLock = cli.appStateCollectionLock
 	cli.paired.Store(deviceStore.ID != nil)
 	cli.nodeHandlers = map[string]nodeHandler{
 		"message":      cli.handleEncryptedMessage,

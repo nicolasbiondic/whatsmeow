@@ -157,6 +157,9 @@ type Processor struct {
 	keyCacheLock sync.Mutex
 	Store        *store.Device
 	Log          waLog.Logger
+	// CollectionLock, when set, serializes patch persistence with external
+	// recovery/reset writes and checks that the decoded base is still current.
+	CollectionLock func(WAPatchName) sync.Locker
 
 	// lidMigratedCache caches positive "this collection has LID-indexed chat
 	// entries" results per collection (see lidwrite.go). Only true is cached:

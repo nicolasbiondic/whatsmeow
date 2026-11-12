@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/appstate/lthash"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 )
@@ -60,6 +62,51 @@ func TestFailedFullSyncRestoresSyntheticState(t *testing.T) {
 	gotMAC, err := device.AppState.GetAppStateMutationMAC(t.Context(), name, macs[0].IndexMAC)
 	if err != nil || string(gotMAC) != string(macs[0].ValueMAC) {
 		t.Fatalf("full sync lost MAC: %x err=%v", gotMAC, err)
+	}
+}
+
+type cancelAfterResetStore struct {
+	store.AppStateStore
+	cancel context.CancelFunc
+}
+
+func (s *cancelAfterResetStore) DeleteAppStateVersion(ctx context.Context, name string) error {
+	err := s.AppStateStore.DeleteAppStateVersion(ctx, name)
+	s.cancel()
+	return err
+}
+
+func (s *cancelAfterResetStore) GetAllAppStateMutationMACs(ctx context.Context, name string) ([]store.AppStateMutationMAC, error) {
+	return s.AppStateStore.(appStateMutationMACDumper).GetAllAppStateMutationMACs(ctx, name)
+}
+
+func TestCancelledFullSyncRestoresSyntheticState(t *testing.T) {
+	device := newSQLiteAppStateDevice(t)
+	name := string(appstate.WAPatchRegularLow)
+	macs := []store.AppStateMutationMAC{{IndexMAC: make([]byte, 32), ValueMAC: make([]byte, 32)}}
+	macs[0].ValueMAC[0] = 4
+	var hash [128]byte
+	lthash.WAPatchIntegrity.SubtractThenAddInPlace(hash[:], nil, [][]byte{macs[0].ValueMAC})
+	if err := device.AppState.PutAppStateVersion(t.Context(), name, 100, hash); err != nil {
+		t.Fatal(err)
+	}
+	if err := device.AppState.PutAppStateMutationMACs(t.Context(), name, 100, macs); err != nil {
+		t.Fatal(err)
+	}
+	before := dumpLatestMACs(t.Context(), t, device.AppState, name)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	device.AppState = &cancelAfterResetStore{AppStateStore: device.AppState, cancel: cancel}
+	cli := NewClient(device, nil)
+	if err := cli.FetchAppState(ctx, appstate.WAPatchRegularLow, true, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled full sync: err=%v, want context.Canceled", err)
+	}
+	version, gotHash, err := device.AppState.GetAppStateVersion(t.Context(), name)
+	if err != nil || version != 100 || gotHash != hash {
+		t.Errorf("cancelled full sync lost state: v%d hash=%x err=%v", version, gotHash, err)
+	}
+	if after := dumpLatestMACs(t.Context(), t, device.AppState, name); !reflect.DeepEqual(before, after) {
+		t.Errorf("cancelled full sync changed MACs: before=%v after=%v", before, after)
 	}
 }
 
@@ -238,7 +285,7 @@ func (f *fakeAppStateVersionStore) GetAllAppStateMutationMACs(ctx context.Contex
 // recovery response adopted (at an equal or newer version) while the sync was
 // running; it must still restore when nothing newer was written. This is the
 // store-level half of the fetchAppState/handleAppStateRecovery race fix (the
-// other half is that both sections run under appStateRecoveryLock). Fails
+// other half is that both sections run under the collection lock). Fails
 // without restoreAppStateVersionIfOlder.
 func TestRestoreSkippedWhenRecoveryAdoptedMidSync(t *testing.T) {
 	ctx := context.Background()
@@ -271,7 +318,7 @@ func TestRestoreSkippedWhenRecoveryAdoptedMidSync(t *testing.T) {
 			f := newFakeAppStateVersionStore()
 			seed(f, 1650, 0x01, 0x10)
 
-			// fetchAppState: capture + delete (under appStateRecoveryLock).
+			// fetchAppState: capture + delete (under the collection lock).
 			backup, err := captureAppStateVersion(ctx, f, "regular_low")
 			if err != nil || backup == nil {
 				t.Fatalf("capture: %v (backup=%v)", err, backup)
