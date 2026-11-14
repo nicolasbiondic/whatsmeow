@@ -39,7 +39,8 @@ import (
 //
 // While too many batches of the collection are undelivered, this fails with an AppStateBacklogError
 // before it stores anything. The client then owes the collection an incremental fetch and does it by
-// itself once the event handlers have caught up (see events.AppStateDeferred).
+// itself once the event handlers have caught up (see events.AppStateDeferred). Between PauseAppState
+// and ResumeAppState it fails with ErrAppStatePaused, and the fetch is owed the same way.
 func (cli *Client) FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
 	return cli.fetchAppStateFrom(ctx, name, fullSync, onlyIfNotSynced, appStateOrigin{source: "fetch"})
 }
@@ -106,7 +107,9 @@ func (cli *Client) fetchAppStateBatch(ctx context.Context, name appstate.WAPatch
 			cli.finishAppStateBatch(batch, nil)
 		}
 	}()
-	if origin.first {
+	// While app state is paused every fetch claims first, and is refused
+	// before it reads a store.
+	if origin.first || cli.appStatePaused() {
 		if err := cli.claimAppStateBatch(batch); err != nil {
 			return nil, nil, err
 		}
@@ -328,23 +331,40 @@ func (cli *Client) handleAppStateRecovery(
 	} else if len(result) > 1 {
 		cli.Log.Warnf("Unexpected number of app state recovery results for %s: %d", reqID, len(result))
 	}
-	var eventsToDispatch []any
-	eventsToDispatchPtr := &eventsToDispatch
-	if !cli.EmitAppStateEventsOnFullSync {
-		eventsToDispatchPtr = nil
-	}
 	snapshot, err := appstate.ParseRecovery(result[0].GetSyncdSnapshotFatalRecoveryResponse())
 	if err != nil {
 		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
 		return true
 	}
+	handled, err := cli.adoptAppStateRecovery(ctx, &deferredAppStateRecovery{
+		reqID: reqID, snapshot: snapshot, version: snapshot.GetVersion().GetVersion(),
+	}, false)
+	if err != nil && !errors.Is(err, ErrAppStateBacklog) && !errors.Is(err, ErrAppStatePaused) {
+		cli.Log.Warnf("Did not adopt app state recovery response for %s: %v", reqID, err)
+	}
+	return handled
+}
+
+// adoptAppStateRecovery adopts a recovery snapshot and publishes its events.
+// The error says why it was not adopted. handled is false only when an event
+// handler rejected the adopted batch.
+//
+// A snapshot that the backlog refuses is not lost and not left to the
+// sender: the message that carried it is acknowledged like any other, so the
+// snapshot is kept and adopted when the backlog has capacity again
+// (deferredAppStateRecovery). retry marks that later attempt.
+func (cli *Client) adoptAppStateRecovery(ctx context.Context, recovery *deferredAppStateRecovery, retry bool) (handled bool, err error) {
+	reqID, snapshot, version := recovery.reqID, recovery.snapshot, recovery.version
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
-	version := snapshot.GetVersion().GetVersion()
-	batch := &appStateBatch{name: name, source: "recovery"}
+	var eventsToDispatch []any
+	eventsToDispatchPtr := &eventsToDispatch
+	if !cli.EmitAppStateEventsOnFullSync {
+		eventsToDispatchPtr = nil
+	}
+	batch := &appStateBatch{name: name, source: "recovery", version: version, recovery: recovery, quiet: retry}
 	if err = cli.claimAppStateBatch(batch); err != nil {
-		// Not handled: the snapshot is neither adopted nor acknowledged, so
-		// the server delivers it again. The refusal was logged and reported.
-		return false
+		// Refused before anything was stored. It was logged and reported.
+		return true, err
 	}
 	published := false
 	defer func() {
@@ -363,35 +383,31 @@ func (cli *Client) handleAppStateRecovery(
 	// The batch takes its place in the publication order before the lock is
 	// released, so a fetch that committed earlier cannot deliver its events
 	// after this snapshot's.
-	mutations, ok := func() ([]appstate.Mutation, bool) {
+	mutations, err := func() ([]appstate.Mutation, error) {
 		lock := cli.appStateCollectionLock(name)
 		lock.Lock()
 		defer lock.Unlock()
 		currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 		if err != nil {
-			cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
-			return nil, false
+			return nil, fmt.Errorf("failed to get the current app state %s version: %w", name, err)
 		} else if currentVersion > version {
-			cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
-			return nil, false
+			return nil, fmt.Errorf("the stored app state %s version %d is newer than the recovery version %d", name, currentVersion, version)
 		}
 		cli.Log.Debugf("Handling app state recovery response for %s", reqID)
 		mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
 		if err != nil {
-			cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
-			return nil, false
+			return nil, fmt.Errorf("failed to process the recovery snapshot: %w", err)
 		}
 		cli.appStatePublisher.reserve(batch)
-		return mutations, true
+		return mutations, nil
 	}()
-	if !ok {
-		return true
+	if err != nil {
+		return true, err
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncStart{Name: name, Recovery: true})
 	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
 	if err != nil {
-		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
-		return true
+		return true, fmt.Errorf("failed to collect the events of the adopted recovery snapshot: %w", err)
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
 	// 0: still queued behind an earlier batch, 1: dispatched, 2: a handler failed.
@@ -407,15 +423,15 @@ func (cli *Client) handleAppStateRecovery(
 	})
 	switch outcome.Load() {
 	case 2:
-		return false
+		return false, nil
 	case 0:
 		// Its publisher delivers this snapshot next; waiting here could
 		// deadlock with a handler of that batch.
 		cli.Log.Debugf("App state recovery response for %s (%s to v%d) is stored; its events follow an earlier batch of the collection", reqID, name, version)
-		return true
+		return true, nil
 	}
 	cli.Log.Debugf("Finished handling app state recovery response for %s (%s to v%d)", reqID, name, version)
-	return true
+	return true, nil
 }
 
 // Keep the handler set stable through the recovery batch, and close only those

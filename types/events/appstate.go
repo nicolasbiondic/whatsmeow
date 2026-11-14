@@ -210,33 +210,42 @@ type AppStateSyncError struct {
 
 // AppStateDeferred is emitted when app state work for a collection was
 // refused because its event batches are backed up in the event handlers
-// (Client.AppStateBacklogLimit). Nothing was sent or stored. The client owes
-// the collection a fetch and does it by itself when the handlers have caught
-// up, followed by AppStateCaughtUp.
+// (Client.AppStateBacklogLimit). Nothing was sent or stored. The client makes
+// up for it by itself when the handlers have caught up: it does the fetch it
+// owes the collection, or adopts the recovery snapshot it kept. That ends
+// with AppStateCaughtUp or AppStateCatchUpFailed.
 //
 // This and the two events below are not part of a collection's ordered
-// batches: they can arrive while a handler is still holding one.
+// batches: they can arrive while a handler is still holding one. While they
+// cannot be delivered, only the latest of each kind per collection is kept.
 type AppStateDeferred struct {
 	Name appstate.WAPatchName
 	// Source is what was refused: "notification", "fetch", "ordered fetch",
 	// "send", "conflict" or "recovery".
 	Source string
-	// Version is the highest version a server notification has announced for
-	// the collection since it fell behind, or zero if none did.
+	// Version is the version of the refused recovery snapshot, or else the
+	// highest version a server notification has announced for the collection
+	// since it fell behind, or zero if none did.
 	Version   uint64
 	Depth     int
 	OldestAge time.Duration
 }
 
-// AppStateCaughtUp is emitted when a fetch has made up for the work that
-// AppStateDeferred reported.
+// AppStateCaughtUp is emitted when the client has made up for the work that
+// AppStateDeferred reported: a fetch of the collection completed with the
+// server, or the deferred recovery snapshot was adopted.
 type AppStateCaughtUp struct {
 	Name    appstate.WAPatchName
 	Version uint64
 }
 
-// AppStateCatchUpFailed is emitted when the fetch owed after AppStateDeferred
-// failed. It is tried again after RetryIn.
+// AppStateCatchUpFailed is emitted when making up for the work that
+// AppStateDeferred reported failed.
+//
+// With a RetryIn, the owed fetch is tried again after that time. Without
+// one, nothing is scheduled: an owed fetch waits for the next connection
+// (the client was disconnected, or the fetch kept failing) or for any other
+// fetch of the collection, and a deferred recovery snapshot was dropped.
 type AppStateCatchUpFailed struct {
 	Name    appstate.WAPatchName
 	Version uint64

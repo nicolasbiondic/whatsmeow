@@ -26,6 +26,10 @@ const DefaultAppStateBacklogLimit = 64
 // their collection are still undelivered. See AppStateBacklogError.
 var ErrAppStateBacklog = errors.New("app state events are backed up")
 
+// ErrAppStatePaused is what app state fetches and sends fail with between
+// Client.PauseAppState and Client.ResumeAppState. Nothing was sent or stored.
+var ErrAppStatePaused = errors.New("app state is paused")
+
 // AppStateBacklogError reports that nothing was sent or stored, because the
 // collection's event backlog is at Client.AppStateBacklogLimit. It is
 // transient. A fetch it refused is owed: the client does it by itself once
@@ -62,11 +66,14 @@ type appStateBatch struct {
 	source  string // what asked for it, for the diagnostics of a refusal
 	version uint64 // the version a server notification announced, if one did
 	quiet   bool   // a catch-up attempt: a refusal is already known and owed
-	claimed bool   // holds backlog capacity, has no queue place yet
-	queued  bool
-	ready   bool
-	since   time.Time
-	publish func()
+	// recovery is the snapshot this batch adopts. Refused, it is kept and
+	// adopted later instead of leaving a fetch owed.
+	recovery *deferredAppStateRecovery
+	claimed  bool // holds backlog capacity, has no queue place yet
+	queued   bool
+	ready    bool
+	since    time.Time
+	publish  func()
 }
 
 type appStateBatchKey struct{}
@@ -81,7 +88,7 @@ type appStateBatchKey struct{}
 // Committed batches are never dropped and producers never wait, so the queue
 // is bounded where work begins: a batch claims capacity before its first step
 // that stores or sends anything (claimAppStateBatch), and is refused there.
-// What a refusal skipped is owed and fetched later (appstate_catchup.go).
+// What a refusal skipped is made up for later (appstate_catchup.go).
 type appStatePublisher struct {
 	mu       sync.Mutex
 	pending  map[appstate.WAPatchName][]*appStateBatch
@@ -93,12 +100,18 @@ type appStatePublisher struct {
 
 	// Catch-up of refused work, see appstate_catchup.go.
 	owed       map[appstate.WAPatchName]*appStateDebt
+	recoveries map[appstate.WAPatchName]*deferredAppStateRecovery
 	catchingUp map[appstate.WAPatchName]bool
 	refusals   uint64
 	connects   uint64
 	retryBase  time.Duration
 	notices    []any
 	noticing   bool
+
+	// paused fences new work, see PauseAppState. dropped names the
+	// collections whose recovery snapshot was given up since the last resume.
+	paused  bool
+	dropped map[appstate.WAPatchName]bool
 
 	// changed is closed whenever something a waiter looks at has changed.
 	changed chan struct{}
@@ -113,7 +126,9 @@ func (p *appStatePublisher) initLocked() {
 	p.publishing = make(map[appstate.WAPatchName]time.Time)
 	p.claims = make(map[appstate.WAPatchName]int)
 	p.owed = make(map[appstate.WAPatchName]*appStateDebt)
+	p.recoveries = make(map[appstate.WAPatchName]*deferredAppStateRecovery)
 	p.catchingUp = make(map[appstate.WAPatchName]bool)
+	p.dropped = make(map[appstate.WAPatchName]bool)
 }
 
 func (p *appStatePublisher) backlogLocked(name appstate.WAPatchName) AppStateBacklog {
@@ -140,6 +155,13 @@ func (cli *Client) AppStateBacklog(name appstate.WAPatchName) AppStateBacklog {
 	return p.backlogLocked(name)
 }
 
+func (cli *Client) appStatePaused() bool {
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paused
+}
+
 func (cli *Client) appStateBacklogLimit() int {
 	if cli.AppStateBacklogLimit == 0 {
 		return DefaultAppStateBacklogLimit
@@ -148,15 +170,16 @@ func (cli *Client) appStateBacklogLimit() int {
 }
 
 // claimAppStateBatch takes backlog capacity for the batch, or refuses it
-// with an AppStateBacklogError when the collection is at its limit. The check
-// and the claim are one step, so concurrent producers cannot exceed the limit
-// together. It never waits: a handler whose own batch is the backlog gets the
-// error instead of a deadlock.
+// with an AppStateBacklogError when the collection is at its limit, or with
+// ErrAppStatePaused while app state is paused. The check and the claim are
+// one step, so concurrent producers cannot exceed the limit together. It
+// never waits: a handler whose own batch is the backlog gets the error
+// instead of a deadlock.
 //
 // A batch claims before its first step that stores or sends anything, so a
 // refusal has changed nothing. The claim becomes the batch's queue place when
 // it commits, and is given back when the batch ends with nothing to deliver.
-// A refused fetch is owed: see oweAppStateFetchLocked.
+// What a refusal skipped is remembered: see deferAppStateLocked.
 func (cli *Client) claimAppStateBatch(batch *appStateBatch) error {
 	limit := cli.appStateBacklogLimit()
 	p := &cli.appStatePublisher
@@ -166,18 +189,23 @@ func (cli *Client) claimAppStateBatch(batch *appStateBatch) error {
 		return nil
 	}
 	backlog := p.backlogLocked(batch.name)
-	if limit <= 0 || backlog.Depth < limit {
+	if !p.paused && (limit <= 0 || backlog.Depth < limit) {
 		p.initLocked()
 		batch.claimed = true
 		p.claims[batch.name]++
 		p.mu.Unlock()
 		return nil
 	}
-	version := cli.oweAppStateFetchLocked(batch, backlog)
+	paused := p.paused
+	version := cli.deferAppStateLocked(batch, backlog)
 	p.mu.Unlock()
+	if paused {
+		// Not an alarm: whoever paused is told what is left (PauseAppState).
+		return fmt.Errorf("%w: %s was not synced (%s)", ErrAppStatePaused, batch.name, batch.source)
+	}
 	if !batch.quiet {
 		// ERROR, not WARN: applications commonly log this client at ERROR only.
-		cli.Log.Errorf("App state %s was not synced (%s): %d event batches are undelivered, the oldest for %s; notified version %d. It is fetched when the handlers catch up",
+		cli.Log.Errorf("App state %s was not synced (%s): %d event batches are undelivered, the oldest for %s; notified version %d. It is made up for when the handlers catch up",
 			batch.name, batch.source, backlog.Depth, backlog.OldestAge.Round(time.Millisecond), version)
 	}
 	return &AppStateBacklogError{Name: batch.name, AppStateBacklog: backlog}
@@ -201,15 +229,12 @@ func (p *appStatePublisher) unclaimLocked(batch *appStateBatch) {
 
 // WaitForAppStateEvents blocks until the event handlers have finished every
 // committed app state batch, or until ctx ends. It also waits for app state
-// work that is admitted and still running, including a catch-up fetch, but
-// not for a catch-up that is waiting for a connection or a retry timer.
+// work that is admitted and still running, including a catch-up attempt, but
+// not for a catch-up that is waiting for capacity, a connection or a retry.
 //
-// Disconnect neither waits for these batches nor drops them: their state is
-// already stored, so dropping them would lose them for the application, and
-// waiting would deadlock a handler that disconnects. They keep being
-// delivered on the goroutines that are already dispatching. Call this after
-// Disconnect and before removing event handlers or closing what they write
-// to. Do not call it from an event handler, which would wait for itself.
+// It does not keep new work from being admitted meanwhile, so its result
+// says little about what follows. To shut down, use PauseAppState.
+// Do not call it from an event handler, which would wait for itself.
 func (cli *Client) WaitForAppStateEvents(ctx context.Context) error {
 	p := &cli.appStatePublisher
 	for {
@@ -231,6 +256,90 @@ func (cli *Client) WaitForAppStateEvents(ctx context.Context) error {
 		case <-ctx.Done():
 			return fmt.Errorf("app state events are still being delivered: %w", ctx.Err())
 		}
+	}
+}
+
+// AppStateUnfinished is what PauseAppState found unfinished for a collection.
+type AppStateUnfinished struct {
+	// Undelivered counts the event batches that are committed or still
+	// running and that the event handlers have not finished.
+	Undelivered int
+	// Owed is set when a fetch that was refused, by the backlog or by the
+	// pause, has not been made up for. The server still has those changes.
+	Owed bool
+	// RecoveryDropped is set when a recovery snapshot that was deferred, or
+	// that arrived during the pause, was dropped without being adopted.
+	RecoveryDropped bool
+}
+
+// PauseAppState fences app state work and waits for what is under way.
+//
+// From here until ResumeAppState, fetches, sends and recovery adoptions fail
+// with ErrAppStatePaused before they send or store anything, without the
+// ERROR log and the events.AppStateDeferred of a backlog refusal. A refused
+// fetch is still owed, and made up for after the resume. No catch-up attempt
+// starts, pending retries are cancelled, and recovery snapshots that were
+// deferred are dropped.
+//
+// It then waits, like WaitForAppStateEvents, until the event handlers have
+// finished everything that was committed and the admitted work has ended, or
+// until ctx ends. It returns what is unfinished per collection: empty when
+// everything was delivered and nothing is owed. The error is ctx's when the
+// wait ended first; app state stays paused either way.
+//
+// Call it, with the event handlers still registered, before removing them or
+// closing what they write to. Disconnect neither waits for committed batches
+// nor drops them. Do not call it from an event handler.
+func (cli *Client) PauseAppState(ctx context.Context) (map[appstate.WAPatchName]AppStateUnfinished, error) {
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	p.initLocked()
+	p.paused = true
+	for _, debt := range p.owed {
+		debt.stopTimer()
+	}
+	for name, recovery := range p.recoveries {
+		cli.dropAppStateRecoveryLocked(name, recovery, ErrAppStatePaused)
+	}
+	p.mu.Unlock()
+	err := cli.WaitForAppStateEvents(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	unfinished := make(map[appstate.WAPatchName]AppStateUnfinished)
+	note := func(name appstate.WAPatchName) {
+		unfinished[name] = AppStateUnfinished{Undelivered: p.backlogLocked(name).Depth, Owed: p.owed[name] != nil, RecoveryDropped: p.dropped[name]}
+	}
+	for name := range p.pending {
+		note(name)
+	}
+	for name := range p.publishing {
+		note(name)
+	}
+	for name := range p.claims {
+		note(name)
+	}
+	for name := range p.owed {
+		note(name)
+	}
+	for name := range p.dropped {
+		note(name)
+	}
+	return unfinished, err
+}
+
+// ResumeAppState ends PauseAppState: work is admitted again, and what was
+// refused meanwhile is fetched.
+func (cli *Client) ResumeAppState() {
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.paused {
+		return
+	}
+	p.paused = false
+	clear(p.dropped)
+	for name := range p.owed {
+		cli.resumeAppStateCatchUpLocked(name)
 	}
 }
 
@@ -334,7 +443,7 @@ func (cli *Client) appStateBacklogChangedLocked(name appstate.WAPatchName) {
 		close(p.changed)
 		p.changed = nil
 	}
-	if len(p.owed) > 0 {
+	if len(p.owed)+len(p.recoveries) > 0 {
 		cli.resumeAppStateCatchUpLocked(name)
 	}
 }

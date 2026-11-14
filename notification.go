@@ -86,8 +86,8 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 			return false
 		} else if errors.Is(err, ErrAppStateRateLimited) {
 			cli.Log.Debugf("Not syncing app state after notification: %v", err)
-		} else if errors.Is(err, ErrAppStateBacklog) {
-			// Logged and reported where it was refused (claimAppStateBatch).
+		} else if errors.Is(err, ErrAppStateBacklog) || errors.Is(err, ErrAppStatePaused) {
+			// Owed, and logged and reported, where it was refused (claimAppStateBatch).
 		} else if err != nil {
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
 		}

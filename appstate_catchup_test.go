@@ -3,6 +3,9 @@ package whatsmeow
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -143,8 +146,9 @@ func TestAppStateCatchUpRetriesAfterAFailure(t *testing.T) {
 	}
 }
 
-// Without a connection the attempt is not repeated on a timer. It is made
-// after the next connect, also when that connect came while it was failing.
+// Disconnect parks what is owed: no attempt is made, and no store is read,
+// until the next connect, also when that connect comes while an earlier
+// attempt is still failing.
 func TestAppStateCatchUpWaitsForTheConnection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -154,33 +158,43 @@ func TestAppStateCatchUpWaitsForTheConnection(t *testing.T) {
 	p := &cli.appStatePublisher
 	cli.Disconnect()
 
-	cli.finishAppStateBatch(slot, nil)
-	if err := cli.WaitForAppStateEvents(ctx); err != nil {
-		t.Fatal(err)
-	}
 	debt, owed := p.debt(appstate.WAPatchRegular)
-	if !owed || !debt.offline || debt.timer != nil || counting.attempts.Load() != 1 || len(notices.failed()) != 0 {
-		t.Fatalf("debt after an attempt without a connection: owed=%v %+v attempts=%d", owed, debt, counting.attempts.Load())
+	if !owed || !debt.offline || debt.timer != nil {
+		t.Fatalf("debt after Disconnect: owed=%v %+v", owed, debt)
 	}
-	// More drains do not repeat it.
+	// Capacity coming back, and more drains, do not start an attempt.
+	cli.finishAppStateBatch(slot, nil)
 	cli.finishAppStateBatch(&appStateBatch{name: appstate.WAPatchRegular}, func() {})
-	if err := cli.WaitForAppStateEvents(ctx); err != nil || counting.attempts.Load() != 1 {
-		t.Fatalf("attempt repeated without a connection: attempts=%d err=%v", counting.attempts.Load(), err)
+	if err := cli.WaitForAppStateEvents(ctx); err != nil || counting.attempts.Load() != 0 {
+		t.Fatalf("attempt without a connection: attempts=%d err=%v", counting.attempts.Load(), err)
+	}
+	// The application is told once that nothing is scheduled.
+	failed := notices.failed()
+	if len(failed) != 1 || failed[0].RetryIn != 0 || !errors.Is(failed[0].Error, ErrNotConnected) || failed[0].Version != 102 {
+		t.Fatalf("parking reported as %+v", failed)
+	}
+	// An attempt that slips through checks the connection before any store.
+	p.mu.Lock()
+	p.catchingUp[appstate.WAPatchRegular] = true
+	connects := p.connects
+	p.mu.Unlock()
+	cli.catchUpAppState(appstate.WAPatchRegular, connects)
+	if counting.attempts.Load() != 0 || len(notices.failed()) != 1 {
+		t.Fatalf("disconnected attempt read the store or reported again: attempts=%d", counting.attempts.Load())
 	}
 
 	// A connect that comes while an attempt is failing must not be lost.
 	p.mu.Lock()
 	p.catchingUp[appstate.WAPatchRegular] = true
 	stale := p.connects
-	p.owed[appstate.WAPatchRegular].offline = false
 	p.mu.Unlock()
 	cli.resumeAppStateCatchUps()
 	cli.endAppStateCatchUp(appstate.WAPatchRegular, stale, ErrNotConnected)
 	if err := cli.WaitForAppStateEvents(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if debt, _ := p.debt(appstate.WAPatchRegular); !debt.offline || counting.attempts.Load() != 2 {
-		t.Fatalf("connect during a failing attempt was lost: %+v attempts=%d", debt, counting.attempts.Load())
+	if debt, _ := p.debt(appstate.WAPatchRegular); !debt.offline || counting.attempts.Load() != 0 {
+		t.Fatalf("connect during a failing attempt: %+v attempts=%d, want one attempt that found no connection", debt, counting.attempts.Load())
 	}
 
 	// Reconnect to a peer that has the same patch log, through the client's
@@ -199,6 +213,54 @@ func TestAppStateCatchUpWaitsForTheConnection(t *testing.T) {
 	}
 	if _, owed := p.debt(appstate.WAPatchRegular); owed || labelVersion(t, cli) != 102 || reconnected.fetches.Load() != 1 || len(notices.caughtUp()) != 1 {
 		t.Fatalf("not caught up after the reconnect: version=%d fetches=%d", labelVersion(t, cli), reconnected.fetches.Load())
+	}
+}
+
+// A fetch that keeps failing is not retried forever: after a few attempts it
+// says so once and waits for the next connection, or for any other fetch.
+func TestAppStateCatchUpGivesUpUntilTheNextConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cli, _, notices, slot := owedLabels(t, ctx, 102)
+	log := &errorLog{}
+	cli.Log = log
+	failing := &failingVersionStore{AppStateStore: cli.Store.AppState}
+	failing.failures.Store(1000)
+	cli.Store.AppState = failing
+	p := &cli.appStatePublisher
+	p.retryBase = time.Millisecond
+
+	cli.finishAppStateBatch(slot, nil)
+	eventually(t, ctx, "the catch-up to give up", func() bool {
+		debt, _ := p.debt(appstate.WAPatchRegular)
+		return debt.offline
+	})
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// More drains change nothing.
+	cli.finishAppStateBatch(&appStateBatch{name: appstate.WAPatchRegular}, func() {})
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	debt, owed := p.debt(appstate.WAPatchRegular)
+	failed := notices.failed()
+	last := failed[len(failed)-1]
+	if !owed || debt.timer != nil || failing.attempts.Load() != appStateCatchUpMaxFailures || last.RetryIn != 0 || !strings.Contains(last.Error.Error(), "gave up after 5 attempts") {
+		t.Fatalf("owed=%v debt=%+v attempts=%d last notice=%+v", owed, debt, failing.attempts.Load(), last)
+	}
+	lines := log.get()
+	if len(lines) != appStateCatchUpMaxFailures || !strings.Contains(lines[len(lines)-1], "Giving up on catching up app state regular") {
+		t.Fatalf("ERROR lines: %q", lines)
+	}
+
+	failing.failures.Store(0)
+	cli.resumeAppStateCatchUps()
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, owed := p.debt(appstate.WAPatchRegular); owed || labelVersion(t, cli) != 102 || len(notices.caughtUp()) != 1 {
+		t.Fatalf("not caught up after the next connect: version=%d", labelVersion(t, cli))
 	}
 }
 
@@ -449,11 +511,7 @@ func TestMixedAppStateProducersCannotExceedTheLimit(t *testing.T) {
 	var refused atomic.Int32
 	for i := range producers {
 		recovery := labelRecovery(t, cli, uint64(200+i), "recovered")
-		others.Go(func() {
-			if !cli.handleAppStateRecovery(ctx, "racing-recovery", recovery) {
-				refused.Add(1)
-			}
-		})
+		others.Go(func() { cli.handleAppStateRecovery(ctx, "racing-recovery", recovery) })
 		others.Go(func() {
 			if errors.Is(cli.FetchAppState(ctx, appstate.WAPatchRegular, false, false), ErrAppStateBacklog) {
 				refused.Add(1)
@@ -461,8 +519,13 @@ func TestMixedAppStateProducersCannotExceedTheLimit(t *testing.T) {
 		})
 	}
 	others.Wait()
-	if depth := cli.AppStateBacklog(appstate.WAPatchRegular).Depth; depth != limit || refused.Load() != 2*producers || labelVersion(t, cli) != 101 {
-		t.Fatalf("limit=%d depth=%d refused=%d of %d", limit, depth, refused.Load(), 2*producers)
+	// No recovery was adopted either: the newest one is kept for later.
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	kept := p.recoveries[appstate.WAPatchRegular]
+	p.mu.Unlock()
+	if depth := cli.AppStateBacklog(appstate.WAPatchRegular).Depth; depth != limit || refused.Load() != producers || labelVersion(t, cli) != 101 || kept == nil || kept.version != 200+producers-1 {
+		t.Fatalf("limit=%d depth=%d refused fetches=%d of %d kept recovery=%+v", limit, depth, refused.Load(), producers, kept)
 	}
 
 	// The admitted sends go on: conflict batch, retry, its events.
@@ -480,18 +543,17 @@ func TestMixedAppStateProducersCannotExceedTheLimit(t *testing.T) {
 	if err := cli.WaitForAppStateEvents(ctx); err != nil {
 		t.Fatal(err)
 	}
-	p := &cli.appStatePublisher
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if backlog := p.backlogLocked(appstate.WAPatchRegular); backlog.Depth != 0 || len(p.claims) != 0 || len(p.owed) != 0 {
-		t.Fatalf("capacity was not given back: %+v claims=%v owed=%d", backlog, p.claims, len(p.owed))
+	if backlog := p.backlogLocked(appstate.WAPatchRegular); backlog.Depth != 0 || len(p.claims) != 0 || len(p.owed) != 0 || len(p.recoveries) != 0 {
+		t.Fatalf("capacity was not given back: %+v claims=%v owed=%d recoveries=%d", backlog, p.claims, len(p.owed), len(p.recoveries))
 	}
 }
 
-// The notices are diagnostics, not committed state. While a handler keeps
-// them from being delivered they do not pile up without limit, and every
-// refusal is still logged.
-func TestAppStateNoticesAreBounded(t *testing.T) {
+// While a handler keeps the notices from being delivered they do not pile
+// up: the latest of each kind per collection is kept, so what arrives last
+// for a collection is its latest state. Every refusal is still logged.
+func TestAppStateNoticesAreCoalesced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	cli, _, notices, slot := owedLabels(t, ctx, 102)
@@ -507,7 +569,7 @@ func TestAppStateNoticesAreBounded(t *testing.T) {
 			})
 		}
 	})
-	const refusals = 3 * maxAppStateNotices
+	const refusals = 200
 	for i := range refusals {
 		cli.handleAppStateNotification(ctx, labelNotification(uint64(103+i)))
 		if i == 0 {
@@ -516,18 +578,32 @@ func TestAppStateNoticesAreBounded(t *testing.T) {
 	}
 	p := &cli.appStatePublisher
 	p.mu.Lock()
-	queued := len(p.notices)
+	queued := append([]any(nil), p.notices...)
 	p.mu.Unlock()
-	if queued != maxAppStateNotices || len(log.get()) != refusals {
-		t.Fatalf("queued notices=%d (limit %d), ERROR lines=%d of %d", queued, maxAppStateNotices, len(log.get()), refusals)
+	if len(queued) != 1 || queued[0].(*events.AppStateDeferred).Version != 103+refusals-1 || len(log.get()) != refusals {
+		t.Fatalf("queued notices=%d, ERROR lines=%d of %d", len(queued), len(log.get()), refusals)
+	}
+	// A different kind is kept beside it, and a newer one moves to the end.
+	p.mu.Lock()
+	cli.noticeAppStateLocked(&events.AppStateCaughtUp{Name: appstate.WAPatchRegular, Version: 1})
+	cli.noticeAppStateLocked(&events.AppStateDeferred{Name: appstate.WAPatchRegularLow})
+	cli.noticeAppStateLocked(&events.AppStateDeferred{Name: appstate.WAPatchRegular, Version: 9000})
+	order := make([]string, len(p.notices))
+	for i, queued := range p.notices {
+		kind, name := appStateNoticeKey(queued)
+		order[i] = fmt.Sprint(kind, name)
+	}
+	p.mu.Unlock()
+	if want := []string{"2regular", "1regular_low", "1regular"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("queued notices %v, want %v", order, want)
 	}
 	close(release)
 	cli.finishAppStateBatch(slot, nil)
 	if err := cli.WaitForAppStateEvents(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// One from the setup, the held one, and those that fit behind it.
-	if got := len(notices.deferred()); got != 2+maxAppStateNotices || len(notices.caughtUp()) != 1 || labelVersion(t, cli) != 102 {
-		t.Fatalf("delivered %d refusals, %d caught up, version %d", got, len(notices.caughtUp()), labelVersion(t, cli))
+	deferred := notices.deferred()
+	if last := deferred[len(deferred)-1]; last.Name != appstate.WAPatchRegular || last.Version != 9000 || labelVersion(t, cli) != 102 {
+		t.Fatalf("last refusal delivered: %+v, version %d", last, labelVersion(t, cli))
 	}
 }

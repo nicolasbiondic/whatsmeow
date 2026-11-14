@@ -715,7 +715,9 @@ func (cli *Client) IsConnected() bool {
 //
 // App state event batches that were already committed are neither dropped
 // nor waited for: event handlers can still be called after this returns.
-// Use WaitForAppStateEvents before removing them or closing their stores.
+// Use PauseAppState before removing them or closing their stores. Fetches
+// that are owed after a backlog refusal wait for the next connection, and
+// deferred recovery snapshots are dropped (events.AppStateCatchUpFailed).
 func (cli *Client) Disconnect() {
 	if cli == nil {
 		return
@@ -725,6 +727,7 @@ func (cli *Client) Disconnect() {
 	cli.unlockedDisconnect()
 	cli.socketLock.Unlock()
 	cli.clearDelayedMessageRequests()
+	cli.parkAppStateCatchUps()
 }
 
 // ResetConnection disconnects from the WhatsApp web websocket and forces an automatic reconnection.
