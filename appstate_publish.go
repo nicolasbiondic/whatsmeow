@@ -112,6 +112,11 @@ type appStatePublisher struct {
 	// collections whose recovery snapshot was given up since the last resume.
 	paused  bool
 	dropped map[appstate.WAPatchName]bool
+	// disconnected is set from the moment the socket goes away until the
+	// next login: what is owed waits for that login (appStateDebtNext).
+	disconnected bool
+	// catchUp replaces Client.catchUpAppState in tests of the state machine.
+	catchUp func(name appstate.WAPatchName, connects uint64)
 
 	// changed is closed whenever something a waiter looks at has changed.
 	changed chan struct{}
@@ -295,8 +300,8 @@ func (cli *Client) PauseAppState(ctx context.Context) (map[appstate.WAPatchName]
 	p.mu.Lock()
 	p.initLocked()
 	p.paused = true
-	for _, debt := range p.owed {
-		debt.stopTimer()
+	for name, debt := range p.owed {
+		cli.appStateDebtEventLocked(name, debt, debtPaused, nil)
 	}
 	for name, recovery := range p.recoveries {
 		cli.dropAppStateRecoveryLocked(name, recovery, ErrAppStatePaused)

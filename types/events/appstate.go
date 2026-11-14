@@ -243,9 +243,11 @@ type AppStateCaughtUp struct {
 // AppStateDeferred reported failed.
 //
 // With a RetryIn, the owed fetch is tried again after that time. Without
-// one, nothing is scheduled: an owed fetch waits for the next connection
-// (the client was disconnected, or the fetch kept failing) or for any other
-// fetch of the collection, and a deferred recovery snapshot was dropped.
+// one, nothing is scheduled. An owed fetch then waits for the next
+// connection, because the client is disconnected or the fetch kept failing;
+// in the second case a new refusal for the collection also starts it over.
+// Any other fetch of the collection settles it. A deferred recovery snapshot
+// was dropped.
 type AppStateCatchUpFailed struct {
 	Name    appstate.WAPatchName
 	Version uint64

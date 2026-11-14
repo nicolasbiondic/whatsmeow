@@ -607,3 +607,93 @@ func TestAppStateNoticesAreCoalesced(t *testing.T) {
 		t.Fatalf("last refusal delivered: %+v, version %d", last, labelVersion(t, cli))
 	}
 }
+
+// A socket that the server or the network closed parks what is owed, like
+// Disconnect does: the retry that was armed does not fire into a client
+// that has no connection.
+func TestLostSocketParksAppStateDebts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cli, _, notices, slot := owedLabels(t, ctx, 102)
+	cli.EnableAutoReconnect = false
+	failing := &failingVersionStore{AppStateStore: cli.Store.AppState}
+	failing.failures.Store(1)
+	cli.Store.AppState = failing
+	p := &cli.appStatePublisher
+	p.retryBase = 50 * time.Millisecond
+	cli.finishAppStateBatch(slot, nil)
+	eventually(t, ctx, "the failed attempt", func() bool { return len(notices.failed()) == 1 })
+
+	cli.socketLock.RLock()
+	lost := cli.socket
+	cli.socketLock.RUnlock()
+	cli.onDisconnect(ctx, lost, true)
+	debt, owed := p.debt(appstate.WAPatchRegular)
+	if !owed || !debt.offline || debt.timer != nil {
+		t.Fatalf("debt after the socket was lost: owed=%v %+v", owed, debt)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	failed := notices.failed()
+	if failing.attempts.Load() != 1 || len(failed) != 2 || failed[1].RetryIn != 0 || !errors.Is(failed[1].Error, ErrNotConnected) {
+		t.Fatalf("attempts=%d notices=%+v", failing.attempts.Load(), failed)
+	}
+	// A socket that is not the current one changes nothing.
+	cli.resumeAppStateCatchUps()
+	cli.onDisconnect(ctx, lost, true)
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	disconnected := p.disconnected
+	p.mu.Unlock()
+	if disconnected {
+		t.Fatal("an old socket's end parked the debts of the current connection")
+	}
+}
+
+// Work refused while the client is disconnected is owed like any other, and
+// waits for the connection from the start: capacity coming back starts
+// nothing, and no store is read.
+func TestAppStateDebtOfADisconnectedClientWaitsForTheConnection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cli, server := reviewLabelClient(t)
+	cli.AppStateBacklogLimit = 1
+	notices := watchBacklog(cli)
+	if err := cli.FetchAppState(ctx, appstate.WAPatchRegular, false, false); err != nil {
+		t.Fatal(err)
+	}
+	appendLabelPatch(t, cli, server, "pending")
+	counting := &failingVersionStore{AppStateStore: cli.Store.AppState}
+	cli.Store.AppState = counting
+	slot := &appStateBatch{name: appstate.WAPatchRegular}
+	if err := cli.claimAppStateBatch(slot); err != nil {
+		t.Fatal(err)
+	}
+	cli.Disconnect()
+	if err := cli.DangerousInternals().FetchAppStateOrdered(ctx, appstate.WAPatchRegular, false, false, func([]any) {}); !errors.Is(err, ErrAppStateBacklog) {
+		t.Fatalf("ordered fetch at the limit: %v", err)
+	}
+	p := &cli.appStatePublisher
+	if debt, owed := p.debt(appstate.WAPatchRegular); !owed || !debt.offline || debt.timer != nil {
+		t.Fatalf("debt of a disconnected client: owed=%v %+v", owed, debt)
+	}
+	cli.finishAppStateBatch(slot, nil)
+	if err := cli.WaitForAppStateEvents(ctx); err != nil || counting.attempts.Load() != 0 || len(notices.failed()) != 0 {
+		t.Fatalf("disconnected client tried to catch up: attempts=%d notices=%d err=%v", counting.attempts.Load(), len(notices.failed()), err)
+	}
+	reconnected := attachFakeServer(t, cli, appstate.WAPatchRegular)
+	server.mu.Lock()
+	reconnected.version, reconnected.patches = server.version, server.patches
+	server.mu.Unlock()
+	cli.resumeAppStateCatchUps()
+	if err := cli.WaitForAppStateEvents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, owed := p.debt(appstate.WAPatchRegular); owed || labelVersion(t, cli) != 102 || len(notices.caughtUp()) != 1 {
+		t.Fatalf("not caught up after the connection: version=%d", labelVersion(t, cli))
+	}
+}

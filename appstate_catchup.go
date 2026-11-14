@@ -22,7 +22,7 @@ import (
 const (
 	appStateCatchUpBackoff = 5 * time.Second
 	// A fetch that keeps failing is tried this many times in a row, 5, 10,
-	// 20 and 40 seconds apart, and then waits for the next connection.
+	// 20 and 40 seconds apart, and is then put on hold.
 	appStateCatchUpMaxFailures = 5
 )
 
@@ -31,19 +31,22 @@ const (
 // is not going to ask again (a server notification is consumed).
 //
 // The client pays it with an ordinary incremental fetch, one at a time per
-// collection, started outside every lock and only while it is connected and
-// not paused: when the backlog has capacity again, after a (re)connect, and
-// after a failed attempt once its backoff has passed. It is settled by any
-// fetch of the collection whose last round with the server began after the
-// last refusal. Versions are not compared: after a server reset to a lower
-// cursor the notified version is never reached.
+// collection, started outside every lock. It is settled by any fetch of the
+// collection whose last round with the server began after the last refusal.
+// Versions are not compared: after a server reset to a lower cursor the
+// notified version is never reached.
+//
+// What a debt waits for is its state. appStateDebtNext is the whole machine,
+// appStateDebtEventLocked the only code that moves a debt through it, and
+// appStateDebtStarts the only rule that starts an attempt.
 type appStateDebt struct {
-	version  uint64      // highest version a notification announced; diagnostics only
-	stamp    uint64      // publisher.refusals at the last refusal
+	version  uint64 // highest version a notification announced; diagnostics only
+	stamp    uint64 // publisher.refusals at the last refusal
+	state    appStateDebtState
 	failures int         // consecutive failed attempts
-	timer    *time.Timer // set while it waits out a backoff
+	timer    *time.Timer // armed exactly while the state is debtBackoff
 	retry    uint64      // which timer that is: a cancelled one may still fire
-	offline  bool        // set while it waits for the next connection
+	offline  bool        // set exactly while the state is debtOffline or debtOnHold
 }
 
 func (debt *appStateDebt) stopTimer() {
@@ -51,6 +54,148 @@ func (debt *appStateDebt) stopTimer() {
 		debt.timer.Stop()
 		debt.timer = nil
 	}
+}
+
+// appStateDebtState is what a debt waits for while no attempt is running.
+// Every wait is for a named event that the client signals itself.
+type appStateDebtState uint8
+
+const (
+	// debtReady waits for nothing of its own. Its attempt is running, or
+	// starts with the next kick: when the worker of its collection ends,
+	// when a batch is delivered or gives its capacity back, and on
+	// ResumeAppState (appStateBacklogChangedLocked, ResumeAppState).
+	debtReady appStateDebtState = iota
+	// debtBackoff waits for its retry timer (retryAppStateCatchUp).
+	debtBackoff
+	// debtOffline waits for the next connection (resumeAppStateCatchUps).
+	debtOffline
+	// debtOnHold gave up after appStateCatchUpMaxFailures attempts. It waits
+	// for the next connection, or for a new refusal: a new reason to try.
+	debtOnHold
+)
+
+type appStateDebtEvent uint8
+
+const (
+	debtRefused             appStateDebtEvent = iota // new work for the collection was refused
+	debtConnected                                    // the client logged in
+	debtDisconnected                                 // the socket went away, or Disconnect was called
+	debtPaused                                       // PauseAppState
+	debtTimerFired                                   // the retry timer of the current backoff fired
+	debtAttemptNoConnection                          // an attempt ended without a connection
+	debtAttemptFailed                                // an attempt ended with any other failure
+	debtEvents
+)
+
+type appStateDebtEffect uint8
+
+const (
+	debtNoEffect       appStateDebtEffect = iota
+	debtAnnounceParked                    // tell the application that nothing is scheduled
+	debtAnnounceGaveUp                    // the same, after the last failed attempt
+	debtArmRetry                          // arm the retry timer and announce the retry
+)
+
+// appStateDebtNext is the state machine of an owed fetch.
+//
+//	state    | refused | connected | disconnected | paused  | timer fired | attempt: no connection | attempt: failed
+//	ready    | ready   | ready     | offline *    | ready   | ready       | offline *              | backoff + (paused: ready; 5th: on hold *)
+//	backoff  | backoff | backoff   | offline *    | ready   | ready       | backoff                | backoff
+//	offline  | offline | ready 0   | offline      | offline | offline     | offline                | offline
+//	on hold  | ready 0 | ready 0   | offline      | on hold | on hold     | on hold                | on hold
+//
+// "0" resets the failure count. "*" announces that nothing is scheduled
+// (events.AppStateCatchUpFailed without a RetryIn), "+" arms the retry timer
+// and announces the retry. A failure counts only in ready, where it belongs
+// to an attempt nothing else has overtaken: after a disconnect it changes
+// nothing, and above all arms no timer. While app state is paused no timer
+// is armed either; the failure is counted and the resume starts the next
+// attempt.
+//
+// Other things happen to a debt without moving it: capacity coming back, the
+// resume, and an attempt that ended refused again or without covering the
+// last refusal only kick it (appStateDebtStarts). Being settled removes it,
+// from any state.
+func appStateDebtNext(state appStateDebtState, event appStateDebtEvent, paused bool, failures int) (appStateDebtState, int, appStateDebtEffect) {
+	switch state {
+	case debtReady:
+		switch event {
+		case debtDisconnected, debtAttemptNoConnection:
+			return debtOffline, failures, debtAnnounceParked
+		case debtAttemptFailed:
+			failures++
+			if failures >= appStateCatchUpMaxFailures {
+				return debtOnHold, failures, debtAnnounceGaveUp
+			} else if paused {
+				return debtReady, failures, debtNoEffect
+			}
+			return debtBackoff, failures, debtArmRetry
+		}
+	case debtBackoff:
+		switch event {
+		case debtDisconnected:
+			return debtOffline, failures, debtAnnounceParked
+		case debtPaused, debtTimerFired:
+			return debtReady, failures, debtNoEffect
+		}
+	case debtOffline:
+		if event == debtConnected {
+			return debtReady, 0, debtNoEffect
+		}
+	case debtOnHold:
+		switch event {
+		case debtRefused, debtConnected:
+			return debtReady, 0, debtNoEffect
+		case debtDisconnected:
+			return debtOffline, failures, debtNoEffect
+		}
+	}
+	return state, failures, debtNoEffect
+}
+
+// appStateDebtStarts is the only rule that starts an attempt: the debt waits
+// for nothing, app state is not paused, no worker (an attempt, or the
+// adoption of a deferred recovery snapshot) is running for the collection,
+// and the backlog has capacity. It is evaluated after every event above and
+// at every kick, so a debt is never left ready with nothing to wake it.
+func appStateDebtStarts(state appStateDebtState, paused, busy, capacity bool) bool {
+	return state == debtReady && !paused && !busy && capacity
+}
+
+// appStateDebtEventLocked moves a debt through appStateDebtNext, applies the
+// effect, and starts the attempt if it may start now. cause is the error
+// that the announcement of an effect carries. It returns the effect and the
+// delay of a retry it armed, for the log.
+func (cli *Client) appStateDebtEventLocked(name appstate.WAPatchName, debt *appStateDebt, event appStateDebtEvent, cause error) (appStateDebtEffect, time.Duration) {
+	p := &cli.appStatePublisher
+	next, failures, effect := appStateDebtNext(debt.state, event, p.paused, debt.failures)
+	if next != debtBackoff || effect == debtArmRetry {
+		debt.stopTimer()
+	}
+	debt.state, debt.failures = next, failures
+	debt.offline = next == debtOffline || next == debtOnHold
+	var retryIn time.Duration
+	switch effect {
+	case debtAnnounceParked:
+		cli.noticeAppStateLocked(&events.AppStateCatchUpFailed{Name: name, Version: debt.version, Error: cause})
+	case debtAnnounceGaveUp:
+		cli.noticeAppStateLocked(&events.AppStateCatchUpFailed{
+			Name: name, Version: debt.version, Error: fmt.Errorf("gave up after %d attempts: %w", failures, cause),
+		})
+	case debtArmRetry:
+		retryIn = p.retryBase
+		if retryIn <= 0 {
+			retryIn = appStateCatchUpBackoff
+		}
+		retryIn <<= failures - 1
+		debt.retry++
+		retry := debt.retry
+		debt.timer = time.AfterFunc(retryIn, func() { cli.retryAppStateCatchUp(name, debt, retry) })
+		cli.noticeAppStateLocked(&events.AppStateCatchUpFailed{Name: name, Version: debt.version, Error: cause, RetryIn: retryIn})
+	}
+	cli.resumeAppStateCatchUpLocked(name)
+	return effect, retryIn
 }
 
 // deferredAppStateRecovery is a recovery snapshot that the backlog refused.
@@ -88,19 +233,21 @@ func (cli *Client) deferAppStateLocked(batch *appStateBatch, backlog AppStateBac
 	} else {
 		debt := p.owed[batch.name]
 		if debt == nil {
+			// Refused while the socket is known to be down, it waits for
+			// the connection like every other debt.
 			debt = &appStateDebt{}
+			if p.disconnected {
+				debt.state, debt.offline = debtOffline, true
+			}
 			p.owed[batch.name] = debt
 		}
 		p.refusals++
 		debt.stamp = p.refusals
 		debt.version = max(debt.version, batch.version)
 		version = debt.version
-		if !p.paused {
-			// New changes are a new reason to try: a debt that gave up, or
-			// that waits for a connection that is there by now, starts over.
-			// An attempt that finds no connection parks it again.
-			debt.failures, debt.offline = 0, false
-		}
+		// A new refusal is a new reason to try: it renews a debt that gave
+		// up, also during a pause, where the attempt starts with the resume.
+		cli.appStateDebtEventLocked(batch.name, debt, debtRefused, nil)
 	}
 	if !p.paused {
 		cli.noticeAppStateLocked(&events.AppStateDeferred{
@@ -136,26 +283,29 @@ func (cli *Client) settleAppStateCatchUp(name appstate.WAPatchName, mark uint64)
 	cli.Log.Infof("App state %s caught up after its event backlog (notified version %d)", name, debt.version)
 }
 
-// resumeAppStateCatchUpLocked starts the attempt for what is not waiting for
-// anything: a deferred recovery snapshot first, then an owed fetch. It is
-// called after everything that can end a wait.
+// resumeAppStateCatchUpLocked is the kick: it starts the worker a collection
+// may start now. A deferred recovery snapshot is adopted first; the owed
+// fetch waits for that worker to end like for any other (appStateDebtStarts).
 func (cli *Client) resumeAppStateCatchUpLocked(name appstate.WAPatchName) {
 	p := &cli.appStatePublisher
-	if p.paused || p.catchingUp[name] {
-		return
-	}
 	recovery, debt := p.recoveries[name], p.owed[name]
-	if recovery == nil && (debt == nil || debt.timer != nil || debt.offline) {
+	if recovery == nil && debt == nil {
 		return
 	}
-	if limit := cli.appStateBacklogLimit(); limit > 0 && p.backlogLocked(name).Depth >= limit {
-		return
-	}
-	p.catchingUp[name] = true
-	if recovery != nil {
+	limit := cli.appStateBacklogLimit()
+	capacity := limit <= 0 || p.backlogLocked(name).Depth < limit
+	busy := p.catchingUp[name]
+	switch {
+	case recovery != nil && !p.paused && !busy && capacity:
+		p.catchingUp[name] = true
 		go cli.adoptDeferredAppStateRecovery(name, recovery)
-	} else {
-		go cli.catchUpAppState(name, p.connects)
+	case recovery == nil && appStateDebtStarts(debt.state, p.paused, busy, capacity):
+		p.catchingUp[name] = true
+		attempt := p.catchUp
+		if attempt == nil {
+			attempt = cli.catchUpAppState
+		}
+		go attempt(name, p.connects)
 	}
 }
 
@@ -165,37 +315,42 @@ func (cli *Client) resumeAppStateCatchUps() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.connects++
+	p.disconnected = false
 	for name, debt := range p.owed {
-		debt.failures, debt.offline = 0, false
-		cli.resumeAppStateCatchUpLocked(name)
+		cli.appStateDebtEventLocked(name, debt, debtConnected, nil)
 	}
 }
 
-// parkAppStateCatchUps is called by Disconnect. Nothing that is owed may
-// touch a store or schedule work once the application has disconnected: it
-// may be closing its stores. Every debt waits for the next connection, and
-// deferred recovery snapshots are dropped.
+// parkAppStateDebts is called when the socket goes away, whoever closed it.
+// Nothing that is owed may arm a timer or touch a store while the client is
+// disconnected: the application may be closing its stores. Every debt waits
+// for the next connection.
+func (cli *Client) parkAppStateDebts() {
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cli.parkAppStateDebtsLocked()
+}
+
+func (cli *Client) parkAppStateDebtsLocked() {
+	p := &cli.appStatePublisher
+	p.disconnected = true
+	for name, debt := range p.owed {
+		cli.appStateDebtEventLocked(name, debt, debtDisconnected, ErrNotConnected)
+	}
+}
+
+// parkAppStateCatchUps is called by Disconnect. Besides parking the debts
+// it drops the deferred recovery snapshots: they are not adopted into stores
+// the application may be closing.
 func (cli *Client) parkAppStateCatchUps() {
 	p := &cli.appStatePublisher
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for name, debt := range p.owed {
-		cli.parkAppStateDebtLocked(name, debt, ErrNotConnected)
-	}
+	cli.parkAppStateDebtsLocked()
 	for name, recovery := range p.recoveries {
 		cli.dropAppStateRecoveryLocked(name, recovery, ErrNotConnected)
 	}
-}
-
-// parkAppStateDebtLocked makes a debt wait for the next connection, and says
-// so once: a retry that was announced is not going to happen.
-func (cli *Client) parkAppStateDebtLocked(name appstate.WAPatchName, debt *appStateDebt, reason error) {
-	debt.stopTimer()
-	if debt.offline {
-		return
-	}
-	debt.offline = true
-	cli.noticeAppStateLocked(&events.AppStateCatchUpFailed{Name: name, Version: debt.version, Error: reason})
 }
 
 func (cli *Client) dropAppStateRecoveryLocked(name appstate.WAPatchName, recovery *deferredAppStateRecovery, reason error) {
@@ -233,42 +388,28 @@ func (cli *Client) catchUpAppState(name appstate.WAPatchName, connects uint64) {
 
 func (cli *Client) endAppStateCatchUp(name appstate.WAPatchName, connects uint64, err error) {
 	p := &cli.appStatePublisher
-	var retryIn time.Duration
-	gaveUp := false
+	effect, retryIn := debtNoEffect, time.Duration(0)
 	p.mu.Lock()
 	delete(p.catchingUp, name)
 	if debt := p.owed[name]; debt != nil && err != nil {
 		switch {
 		case errors.Is(err, ErrAppStateBacklog), errors.Is(err, ErrAppStatePaused):
-			// Refused again. No timer: the next delivered batch, or the
-			// resume, starts the next attempt.
+			// Refused again: the kick below, or a later one, starts over.
 		case errors.Is(err, ErrNotConnected), errors.Is(err, ErrIQDisconnected), errors.Is(err, context.Canceled):
 			// Wait for the next connection, unless it came during the attempt.
 			if p.connects == connects {
-				cli.parkAppStateDebtLocked(name, debt, err)
+				effect, retryIn = cli.appStateDebtEventLocked(name, debt, debtAttemptNoConnection, err)
 			}
 		default:
-			debt.failures++
-			if gaveUp = debt.failures >= appStateCatchUpMaxFailures; gaveUp {
-				cli.parkAppStateDebtLocked(name, debt, fmt.Errorf("gave up after %d attempts: %w", debt.failures, err))
-				break
-			}
-			retryIn = p.retryBase
-			if retryIn <= 0 {
-				retryIn = appStateCatchUpBackoff
-			}
-			retryIn <<= debt.failures - 1
-			debt.retry++
-			retry := debt.retry
-			debt.timer = time.AfterFunc(retryIn, func() { cli.retryAppStateCatchUp(name, debt, retry) })
-			cli.noticeAppStateLocked(&events.AppStateCatchUpFailed{Name: name, Version: debt.version, Error: err, RetryIn: retryIn})
+			effect, retryIn = cli.appStateDebtEventLocked(name, debt, debtAttemptFailed, err)
 		}
 	}
 	cli.appStateBacklogChangedLocked(name)
 	p.mu.Unlock()
-	if gaveUp {
-		cli.Log.Errorf("Giving up on catching up app state %s after its event backlog until the next connection or fetch: %v", name, err)
-	} else if retryIn > 0 {
+	switch effect {
+	case debtAnnounceGaveUp:
+		cli.Log.Errorf("Giving up on catching up app state %s after its event backlog until the next connection or refusal: %v", name, err)
+	case debtArmRetry:
 		cli.Log.Errorf("Failed to catch up app state %s after its event backlog, retrying in %s: %v", name, retryIn, err)
 	}
 }
@@ -278,8 +419,7 @@ func (cli *Client) retryAppStateCatchUp(name appstate.WAPatchName, debt *appStat
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.owed[name] == debt && debt.timer != nil && debt.retry == retry {
-		debt.timer = nil
-		cli.resumeAppStateCatchUpLocked(name)
+		cli.appStateDebtEventLocked(name, debt, debtTimerFired, nil)
 	}
 }
 
