@@ -207,3 +207,39 @@ type AppStateSyncError struct {
 	Error    error
 	FullSync bool
 }
+
+// AppStateDeferred is emitted when app state work for a collection was
+// refused because its event batches are backed up in the event handlers
+// (Client.AppStateBacklogLimit). Nothing was sent or stored. The client owes
+// the collection a fetch and does it by itself when the handlers have caught
+// up, followed by AppStateCaughtUp.
+//
+// This and the two events below are not part of a collection's ordered
+// batches: they can arrive while a handler is still holding one.
+type AppStateDeferred struct {
+	Name appstate.WAPatchName
+	// Source is what was refused: "notification", "fetch", "ordered fetch",
+	// "send", "conflict" or "recovery".
+	Source string
+	// Version is the highest version a server notification has announced for
+	// the collection since it fell behind, or zero if none did.
+	Version   uint64
+	Depth     int
+	OldestAge time.Duration
+}
+
+// AppStateCaughtUp is emitted when a fetch has made up for the work that
+// AppStateDeferred reported.
+type AppStateCaughtUp struct {
+	Name    appstate.WAPatchName
+	Version uint64
+}
+
+// AppStateCatchUpFailed is emitted when the fetch owed after AppStateDeferred
+// failed. It is tried again after RetryIn.
+type AppStateCatchUpFailed struct {
+	Name    appstate.WAPatchName
+	Version uint64
+	Error   error
+	RetryIn time.Duration
+}

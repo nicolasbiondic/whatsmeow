@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -25,9 +26,10 @@ const DefaultAppStateBacklogLimit = 64
 // their collection are still undelivered. See AppStateBacklogError.
 var ErrAppStateBacklog = errors.New("app state events are backed up")
 
-// AppStateBacklogError reports that nothing was fetched, sent or stored,
-// because the collection's event backlog is at Client.AppStateBacklogLimit.
-// It is transient: retry once the event handlers have caught up.
+// AppStateBacklogError reports that nothing was sent or stored, because the
+// collection's event backlog is at Client.AppStateBacklogLimit. It is
+// transient. A fetch it refused is owed: the client does it by itself once
+// the event handlers have caught up (events.AppStateDeferred).
 type AppStateBacklogError struct {
 	Name appstate.WAPatchName
 	AppStateBacklog
@@ -41,21 +43,26 @@ func (e *AppStateBacklogError) Is(target error) bool {
 	return target == ErrAppStateBacklog
 }
 
-// AppStateBacklog describes the committed event batches of one collection
-// that the event handlers have not finished yet.
+// AppStateBacklog describes the event batches of one collection that the
+// event handlers have not finished yet.
 type AppStateBacklog struct {
-	// Depth counts the batch being dispatched and those queued behind it.
+	// Depth counts the batch being dispatched, those queued behind it, and
+	// the work that was admitted and has not committed or ended yet.
 	Depth int
-	// OldestAge is the time since the oldest of them was committed.
+	// OldestAge is the time since the oldest committed one was committed.
 	OldestAge time.Duration
 }
 
-// appStateBatch is the event batch of one fetch, conflict response or
+// appStateBatch is the event batch of one fetch, conflict response, send or
 // recovery. It takes its place in the collection's publication queue when its
 // first write commits, while the collection lock is still held, so the queue
 // order is the commit order regardless of which goroutine publishes first.
 type appStateBatch struct {
 	name    appstate.WAPatchName
+	source  string // what asked for it, for the diagnostics of a refusal
+	version uint64 // the version a server notification announced, if one did
+	quiet   bool   // a catch-up attempt: a refusal is already known and owed
+	claimed bool   // holds backlog capacity, has no queue place yet
 	queued  bool
 	ready   bool
 	since   time.Time
@@ -71,54 +78,131 @@ type appStateBatchKey struct{}
 // fetch the collection it is being called for without deadlocking, and no
 // lock is held while handlers run.
 //
-// Committed batches are never dropped and producers are never blocked, so the
-// queue is bounded at admission instead: see admitAppStateBatch.
+// Committed batches are never dropped and producers never wait, so the queue
+// is bounded where work begins: a batch claims capacity before its first step
+// that stores or sends anything (claimAppStateBatch), and is refused there.
+// What a refusal skipped is owed and fetched later (appstate_catchup.go).
 type appStatePublisher struct {
 	mu       sync.Mutex
 	pending  map[appstate.WAPatchName][]*appStateBatch
 	draining map[appstate.WAPatchName]bool
 	// publishing holds the commit time of the batch that is in the handlers.
 	publishing map[appstate.WAPatchName]time.Time
-	// drained is closed whenever a collection's queue runs empty.
-	drained chan struct{}
+	// claims counts the batches that hold capacity without a queue place.
+	claims map[appstate.WAPatchName]int
+
+	// Catch-up of refused work, see appstate_catchup.go.
+	owed       map[appstate.WAPatchName]*appStateDebt
+	catchingUp map[appstate.WAPatchName]bool
+	refusals   uint64
+	connects   uint64
+	retryBase  time.Duration
+	notices    []any
+	noticing   bool
+
+	// changed is closed whenever something a waiter looks at has changed.
+	changed chan struct{}
 }
 
-// AppStateBacklog returns how many committed event batches of the collection
-// the event handlers have not finished, and how old the oldest one is.
-func (cli *Client) AppStateBacklog(name appstate.WAPatchName) AppStateBacklog {
-	p := &cli.appStatePublisher
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	backlog := AppStateBacklog{Depth: len(p.pending[name])}
-	oldest, publishing := p.publishing[name]
-	if publishing {
-		backlog.Depth++
-	} else if backlog.Depth > 0 {
-		oldest = p.pending[name][0].since
+func (p *appStatePublisher) initLocked() {
+	if p.pending != nil {
+		return
 	}
-	if backlog.Depth > 0 {
+	p.pending = make(map[appstate.WAPatchName][]*appStateBatch)
+	p.draining = make(map[appstate.WAPatchName]bool)
+	p.publishing = make(map[appstate.WAPatchName]time.Time)
+	p.claims = make(map[appstate.WAPatchName]int)
+	p.owed = make(map[appstate.WAPatchName]*appStateDebt)
+	p.catchingUp = make(map[appstate.WAPatchName]bool)
+}
+
+func (p *appStatePublisher) backlogLocked(name appstate.WAPatchName) AppStateBacklog {
+	queue := p.pending[name]
+	backlog := AppStateBacklog{Depth: len(queue) + p.claims[name]}
+	oldest, committed := p.publishing[name]
+	if committed {
+		backlog.Depth++
+	} else if len(queue) > 0 {
+		oldest, committed = queue[0].since, true
+	}
+	if committed {
 		backlog.OldestAge = time.Since(oldest)
 	}
 	return backlog
 }
 
-// admitAppStateBatch refuses new work for a collection whose backlog is at
-// the limit, before anything is fetched or stored. It never waits, so a
-// handler that fetches while its own batch is the backlog gets the error
-// instead of a deadlock, and what it would have fetched stays on the server.
-func (cli *Client) admitAppStateBatch(name appstate.WAPatchName) error {
-	limit := cli.AppStateBacklogLimit
-	if limit == 0 {
-		limit = DefaultAppStateBacklogLimit
+// AppStateBacklog returns how many event batches of the collection the event
+// handlers have not finished, and how old the oldest committed one is.
+func (cli *Client) AppStateBacklog(name appstate.WAPatchName) AppStateBacklog {
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.backlogLocked(name)
+}
+
+func (cli *Client) appStateBacklogLimit() int {
+	if cli.AppStateBacklogLimit == 0 {
+		return DefaultAppStateBacklogLimit
 	}
-	if backlog := cli.AppStateBacklog(name); limit > 0 && backlog.Depth >= limit {
-		return &AppStateBacklogError{Name: name, AppStateBacklog: backlog}
+	return cli.AppStateBacklogLimit
+}
+
+// claimAppStateBatch takes backlog capacity for the batch, or refuses it
+// with an AppStateBacklogError when the collection is at its limit. The check
+// and the claim are one step, so concurrent producers cannot exceed the limit
+// together. It never waits: a handler whose own batch is the backlog gets the
+// error instead of a deadlock.
+//
+// A batch claims before its first step that stores or sends anything, so a
+// refusal has changed nothing. The claim becomes the batch's queue place when
+// it commits, and is given back when the batch ends with nothing to deliver.
+// A refused fetch is owed: see oweAppStateFetchLocked.
+func (cli *Client) claimAppStateBatch(batch *appStateBatch) error {
+	limit := cli.appStateBacklogLimit()
+	p := &cli.appStatePublisher
+	p.mu.Lock()
+	if batch.claimed || batch.queued || batch.ready {
+		p.mu.Unlock()
+		return nil
+	}
+	backlog := p.backlogLocked(batch.name)
+	if limit <= 0 || backlog.Depth < limit {
+		p.initLocked()
+		batch.claimed = true
+		p.claims[batch.name]++
+		p.mu.Unlock()
+		return nil
+	}
+	version := cli.oweAppStateFetchLocked(batch, backlog)
+	p.mu.Unlock()
+	if !batch.quiet {
+		// ERROR, not WARN: applications commonly log this client at ERROR only.
+		cli.Log.Errorf("App state %s was not synced (%s): %d event batches are undelivered, the oldest for %s; notified version %d. It is fetched when the handlers catch up",
+			batch.name, batch.source, backlog.Depth, backlog.OldestAge.Round(time.Millisecond), version)
+	}
+	return &AppStateBacklogError{Name: batch.name, AppStateBacklog: backlog}
+}
+
+// claimAppState claims for the batch that ctx carries for this collection.
+// Callers without one apply their patches outside the publication order.
+func (cli *Client) claimAppState(ctx context.Context, name appstate.WAPatchName) error {
+	if batch, ok := ctx.Value(appStateBatchKey{}).(*appStateBatch); ok && batch.name == name {
+		return cli.claimAppStateBatch(batch)
 	}
 	return nil
 }
 
+func (p *appStatePublisher) unclaimLocked(batch *appStateBatch) {
+	batch.claimed = false
+	if p.claims[batch.name]--; p.claims[batch.name] <= 0 {
+		delete(p.claims, batch.name)
+	}
+}
+
 // WaitForAppStateEvents blocks until the event handlers have finished every
-// committed app state batch, or until ctx ends.
+// committed app state batch, or until ctx ends. It also waits for app state
+// work that is admitted and still running, including a catch-up fetch, but
+// not for a catch-up that is waiting for a connection or a retry timer.
 //
 // Disconnect neither waits for these batches nor drops them: their state is
 // already stored, so dropping them would lose them for the application, and
@@ -130,17 +214,20 @@ func (cli *Client) WaitForAppStateEvents(ctx context.Context) error {
 	p := &cli.appStatePublisher
 	for {
 		p.mu.Lock()
-		busy := len(p.pending) + len(p.draining)
-		if busy > 0 && p.drained == nil {
-			p.drained = make(chan struct{})
+		busy := len(p.pending) + len(p.draining) + len(p.claims) + len(p.catchingUp) + len(p.notices)
+		if p.noticing {
+			busy++
 		}
-		drained := p.drained
+		if busy > 0 && p.changed == nil {
+			p.changed = make(chan struct{})
+		}
+		changed := p.changed
 		p.mu.Unlock()
 		if busy == 0 {
 			return nil
 		}
 		select {
-		case <-drained:
+		case <-changed:
 		case <-ctx.Done():
 			return fmt.Errorf("app state events are still being delivered: %w", ctx.Err())
 		}
@@ -160,6 +247,8 @@ func (cli *Client) noteAppStateCommit(ctx context.Context, name appstate.WAPatch
 	}
 }
 
+// reserve gives a committed batch its queue place. A batch that never
+// claimed is queued all the same: what is committed is never dropped.
 func (p *appStatePublisher) reserve(batch *appStateBatch) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -170,19 +259,24 @@ func (p *appStatePublisher) enqueueLocked(batch *appStateBatch) {
 	if batch.queued {
 		return
 	}
-	if p.pending == nil {
-		p.pending = make(map[appstate.WAPatchName][]*appStateBatch)
-		p.draining = make(map[appstate.WAPatchName]bool)
-		p.publishing = make(map[appstate.WAPatchName]time.Time)
+	p.initLocked()
+	if batch.claimed {
+		p.unclaimLocked(batch)
 	}
 	batch.queued, batch.since = true, time.Now()
 	p.pending[batch.name] = append(p.pending[batch.name], batch)
 }
 
+func (p *appStatePublisher) headReadyLocked(name appstate.WAPatchName) bool {
+	queue := p.pending[name]
+	return len(queue) > 0 && queue[0].ready
+}
+
 // finishAppStateBatch completes a batch and publishes everything that is next
-// in the collection's commit order. A nil publish abandons the batch: nothing
-// is delivered, but later batches stop waiting for it. A batch that committed
-// nothing is ordered at the point it finishes.
+// in the collection's commit order. A nil publish means there is nothing to
+// deliver: the batch gives its claim or its queue place back at once. A batch
+// with something to deliver that committed nothing is ordered at the point it
+// finishes.
 //
 // Callers must not hold appStateSyncLock or a collection lock: batches of
 // other callers may be published from here, and handlers are free to fetch.
@@ -191,46 +285,58 @@ func (cli *Client) finishAppStateBatch(batch *appStateBatch, publish func()) {
 		return
 	}
 	p := &cli.appStatePublisher
+	name := batch.name
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	if batch.ready {
-		p.mu.Unlock()
 		return
 	}
 	batch.ready, batch.publish = true, publish
-	if publish != nil {
+	switch {
+	case publish != nil:
 		p.enqueueLocked(batch)
-	}
-	if !batch.queued || p.draining[batch.name] {
-		p.mu.Unlock()
+	case batch.claimed:
+		p.unclaimLocked(batch)
+	case batch.queued:
+		p.pending[name] = slices.DeleteFunc(p.pending[name], func(queued *appStateBatch) bool { return queued == batch })
+	default:
 		return
 	}
-	p.draining[batch.name] = true
-	for {
-		queue := p.pending[batch.name]
-		if len(queue) == 0 || !queue[0].ready {
-			break
+	if !p.draining[name] && p.headReadyLocked(name) {
+		p.draining[name] = true
+		for p.headReadyLocked(name) {
+			next := p.pending[name][0]
+			p.pending[name][0] = nil
+			p.pending[name] = p.pending[name][1:]
+			if next.publish == nil {
+				continue
+			}
+			p.publishing[name] = next.since
+			p.mu.Unlock()
+			cli.runAppStatePublish(next)
+			p.mu.Lock()
+			delete(p.publishing, name)
+			cli.appStateBacklogChangedLocked(name)
 		}
-		next := queue[0]
-		queue[0] = nil
-		p.pending[batch.name] = queue[1:]
-		if next.publish == nil {
-			continue
-		}
-		p.publishing[batch.name] = next.since
-		p.mu.Unlock()
-		cli.runAppStatePublish(next)
-		p.mu.Lock()
-		delete(p.publishing, batch.name)
+		delete(p.draining, name)
 	}
-	if len(p.pending[batch.name]) == 0 {
-		delete(p.pending, batch.name)
+	if len(p.pending[name]) == 0 {
+		delete(p.pending, name)
 	}
-	delete(p.draining, batch.name)
-	if p.drained != nil {
-		close(p.drained)
-		p.drained = nil
+	cli.appStateBacklogChangedLocked(name)
+}
+
+// appStateBacklogChangedLocked wakes the waiters and, as capacity may have
+// come back, resumes a catch-up that was waiting for it.
+func (cli *Client) appStateBacklogChangedLocked(name appstate.WAPatchName) {
+	p := &cli.appStatePublisher
+	if p.changed != nil {
+		close(p.changed)
+		p.changed = nil
 	}
-	p.mu.Unlock()
+	if len(p.owed) > 0 {
+		cli.resumeAppStateCatchUpLocked(name)
+	}
 }
 
 func (cli *Client) runAppStatePublish(batch *appStateBatch) {
@@ -243,6 +349,10 @@ func (cli *Client) runAppStatePublish(batch *appStateBatch) {
 }
 
 func (cli *Client) dispatchAppStateBatch(batch *appStateBatch, eventsToDispatch []any) {
+	if len(eventsToDispatch) == 0 {
+		cli.finishAppStateBatch(batch, nil)
+		return
+	}
 	cli.finishAppStateBatch(batch, func() {
 		for _, evt := range eventsToDispatch {
 			cli.dispatchEvent(evt)

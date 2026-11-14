@@ -76,7 +76,10 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 		name := appstate.WAPatchName(ag.String("name"))
 		version := ag.Uint64("version")
 		cli.Log.Debugf("Got server sync notification that app state %s has updated to version %d", name, version)
-		err := cli.FetchAppState(ctx, name, false, false)
+		// The notification says there is something to fetch, so it claims its
+		// backlog capacity before asking the server. Refused, it is consumed
+		// all the same: the fetch is owed and the client catches up by itself.
+		err := cli.fetchAppStateFrom(ctx, name, false, false, appStateOrigin{source: "notification", version: version, first: true})
 		if errors.Is(err, ErrIQDisconnected) || errors.Is(err, ErrNotConnected) {
 			// There are some app state changes right before a remote logout, so stop syncing if we're disconnected.
 			cli.Log.Debugf("Failed to sync app state after notification: %v, not trying to sync other states", err)
@@ -84,8 +87,7 @@ func (cli *Client) handleAppStateNotification(ctx context.Context, node *waBinar
 		} else if errors.Is(err, ErrAppStateRateLimited) {
 			cli.Log.Debugf("Not syncing app state after notification: %v", err)
 		} else if errors.Is(err, ErrAppStateBacklog) {
-			// Nothing was fetched: a later fetch picks these changes up.
-			cli.Log.Warnf("Not syncing app state after notification: %v", err)
+			// Logged and reported where it was refused (claimAppStateBatch).
 		} else if err != nil {
 			cli.Log.Errorf("Failed to sync app state after notification: %v", err)
 		}

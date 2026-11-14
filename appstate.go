@@ -36,8 +36,16 @@ import (
 // earlier batch of the same collection is still being dispatched (including when this is called
 // from one of its event handlers), this returns once the state is stored, and the goroutine
 // dispatching that earlier batch delivers these events right after it.
+//
+// While too many batches of the collection are undelivered, this fails with an AppStateBacklogError
+// before it stores anything. The client then owes the collection an incremental fetch and does it by
+// itself once the event handlers have caught up (see events.AppStateDeferred).
 func (cli *Client) FetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) error {
-	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
+	return cli.fetchAppStateFrom(ctx, name, fullSync, onlyIfNotSynced, appStateOrigin{source: "fetch"})
+}
+
+func (cli *Client) fetchAppStateFrom(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool, origin appStateOrigin) error {
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced, origin)
 	if err != nil {
 		return err
 	}
@@ -48,8 +56,10 @@ func (cli *Client) FetchAppState(ctx context.Context, name appstate.WAPatchName,
 // fetchAppStateOrdered is FetchAppState, except that the events go to deliver
 // instead of the event handlers. deliver runs at the batch's place in the
 // collection's commit order, possibly on another goroutine after this returns.
+// It needs a place in that order even when the server has nothing new, as the
+// caller orders its own work by it, so it claims its capacity first.
 func (cli *Client) fetchAppStateOrdered(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool, deliver func([]any)) error {
-	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced, appStateOrigin{source: "ordered fetch", first: true})
 	if err != nil {
 		return err
 	}
@@ -60,7 +70,7 @@ func (cli *Client) fetchAppStateOrdered(ctx context.Context, name appstate.WAPat
 // fetchAppState returns the events to its caller, who applies them itself:
 // the batch leaves the publication order when this returns.
 func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
-	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced)
+	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, name, fullSync, onlyIfNotSynced, appStateOrigin{source: "fetch"})
 	if err != nil {
 		return nil, err
 	}
@@ -68,23 +78,39 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	return eventsToDispatch, nil
 }
 
+// appStateOrigin says who asks for a batch, for the diagnostics of a refusal,
+// and when it claims its backlog capacity: first, before anything else, when
+// it is known to need a queue place; otherwise once the server has answered
+// with something to store, so a fetch that finds nothing is never refused and
+// never queued.
+type appStateOrigin struct {
+	source  string
+	version uint64
+	first   bool
+	quiet   bool
+}
+
 // fetchAppStateBatch fetches a collection and returns its events together
 // with their place in the publication order. The caller must finish the
 // batch. A failed fetch gives its place up here, after the sync lock is
 // released, as that may publish batches that were queued behind it.
-func (cli *Client) fetchAppStateBatch(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) (*appStateBatch, []any, error) {
+func (cli *Client) fetchAppStateBatch(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool, origin appStateOrigin) (*appStateBatch, []any, error) {
 	if cli == nil {
 		return nil, nil, ErrClientIsNil
-	} else if err := cli.admitAppStateBatch(name); err != nil {
-		return nil, nil, err
 	}
 	ctx, batch := newAppStateBatch(ctx, name)
+	batch.source, batch.version, batch.quiet = origin.source, origin.version, origin.quiet
 	fetched := false
 	defer func() {
 		if !fetched {
 			cli.finishAppStateBatch(batch, nil)
 		}
 	}()
+	if origin.first {
+		if err := cli.claimAppStateBatch(batch); err != nil {
+			return nil, nil, err
+		}
+	}
 	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
 	if err != nil {
 		return nil, nil, err
@@ -110,6 +136,10 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 		return nil, err
 	}
 	if fullSync {
+		// Refused here, a full sync has neither captured nor reset anything.
+		if err := cli.claimAppState(ctx, name); err != nil {
+			return nil, err
+		}
 		// Capture the current verified state so a failed full sync can put it
 		// back instead of leaving the collection empty. Without this, accounts
 		// whose full sync can never verify (e.g. after a PN→LID migration on
@@ -144,8 +174,8 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 			return nil, fmt.Errorf("failed to reset app state %s version: %w", name, deleteErr)
 		}
 	}
-	eventsToDispatch, replayed, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
-	if err == nil && replayed {
+	eventsToDispatch, round, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
+	if err == nil && round.replayed {
 		// A successful full replay may intentionally establish a lower cursor
 		// (server reset), which no patch commit takes for superseding the
 		// journal. The replay is complete, so retire whatever reset journal
@@ -188,6 +218,9 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 	if err != nil {
 		return nil, err
 	}
+	if round.asked {
+		cli.settleAppStateCatchUp(name, round.mark)
+	}
 	return eventsToDispatch, nil
 }
 
@@ -207,16 +240,26 @@ func (cli *Client) settleAppStateReset(ctx context.Context, name appstate.WAPatc
 	return nil
 }
 
-// fetchAppStateAfterReset reports whether it replayed the collection from zero.
-func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, bool, error) {
+// appStateRound describes what a fetch did with the server.
+type appStateRound struct {
+	asked    bool   // the server was asked: not the onlyIfNotSynced short-circuit
+	mark     uint64 // appStateCatchUpMark before the last request
+	replayed bool   // the collection was replayed from zero
+}
+
+func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) (_ []any, round appStateRound, _ error) {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to get app state %s version: %w", name, err)
+		return nil, round, fmt.Errorf("failed to get app state %s version: %w", name, err)
 	}
 	if version == 0 {
 		fullSync = true
+		// A replay from zero delivers its boundaries whatever it finds.
+		if err = cli.claimAppState(ctx, name); err != nil {
+			return nil, round, err
+		}
 	} else if onlyIfNotSynced {
-		return nil, false, nil
+		return nil, round, nil
 	}
 
 	state := appstate.HashState{Version: version, Hash: hash}
@@ -232,6 +275,7 @@ func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WA
 		eventsToDispatchPtr = nil
 	}
 	for hasMore {
+		round.asked, round.mark = true, cli.appStateCatchUpMark()
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
 		var iqErr *IQError
 		if errors.As(err, &iqErr) && iqErr.Code == 429 && iqErr.ErrorNode != nil {
@@ -243,26 +287,33 @@ func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WA
 			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
 				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 			}
-			return nil, false, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
+			return nil, round, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
 		} else if !wantSnapshot && patches.Snapshot != nil {
-			return nil, false, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
+			return nil, round, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
 		} else if patches.Snapshot != nil && state != (appstate.HashState{}) {
-			return nil, false, fmt.Errorf("unexpected non-empty input state (v%d) for %s when applying snapshot", state.Version, name)
+			return nil, round, fmt.Errorf("unexpected non-empty input state (v%d) for %s when applying snapshot", state.Version, name)
+		}
+		if patches.Snapshot != nil || len(patches.Patches) > 0 {
+			// The server has something to store. Refused here, nothing is.
+			if err = cli.claimAppState(ctx, name); err != nil {
+				return nil, round, err
+			}
 		}
 		wantSnapshot = false
 		hasMore = patches.HasMorePatches
 		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
 		if err != nil {
-			return nil, false, err
+			return nil, round, err
 		}
 	}
+	round.replayed = fullSync
 	if fullSync {
 		cli.Log.Debugf("Full sync of app state %s completed. Current version: %d", name, state.Version)
 		eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: state.Version})
 	} else {
 		cli.Log.Debugf("Synced app state %s from version %d to %d", name, version, state.Version)
 	}
-	return eventsToDispatch, fullSync, nil
+	return eventsToDispatch, round, nil
 }
 
 func (cli *Client) handleAppStateRecovery(
@@ -289,12 +340,12 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
-	if err = cli.admitAppStateBatch(name); err != nil {
-		// Not handled: the snapshot is neither adopted nor acknowledged.
-		cli.Log.Warnf("Not adopting app state recovery response for %s: %v", reqID, err)
+	batch := &appStateBatch{name: name, source: "recovery"}
+	if err = cli.claimAppStateBatch(batch); err != nil {
+		// Not handled: the snapshot is neither adopted nor acknowledged, so
+		// the server delivers it again. The refusal was logged and reported.
 		return false
 	}
-	batch := &appStateBatch{name: name}
 	published := false
 	defer func() {
 		if !published {
@@ -817,10 +868,19 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
-	} else if err := cli.admitAppStateBatch(patch.Type); err != nil {
-		// Refuse before sending: the events of the patch could not be queued.
+	}
+	// Claim before sending: the events of the patch need their queue place.
+	ctx, batch := newAppStateBatch(ctx, patch.Type)
+	batch.source = "send"
+	if err := cli.claimAppStateBatch(batch); err != nil {
 		return err
 	}
+	dispatched := false
+	defer func() {
+		if !dispatched {
+			cli.finishAppStateBatch(batch, nil)
+		}
+	}()
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
 	if err != nil {
 		return err
@@ -894,12 +954,15 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 			if err != nil {
 				return fmt.Errorf("%w (also, parsing patches in the response failed: %w)", mainErr, err)
 			}
-			batch, eventsToDispatch, err := cli.applyAppStateConflictBatch(ctx, patch.Type, patches)
+			// The rejected patch delivers nothing: its capacity goes back,
+			// to the conflict batch and then to the retry.
+			cli.finishAppStateBatch(batch, nil)
+			conflicts, eventsToDispatch, err := cli.applyAppStateConflictBatch(ctx, patch.Type, patches)
 			if err != nil {
 				return fmt.Errorf("%w (also, applying patches in the response failed: %w)", mainErr, err)
 			} else {
 				zerolog.Ctx(ctx).Debug().Msg("Retrying app state send after applying conflicting patches")
-				go cli.dispatchAppStateBatch(batch, eventsToDispatch)
+				go cli.dispatchAppStateBatch(conflicts, eventsToDispatch)
 				return cli.sendAppState(ctx, patch, false)
 			}
 		}
@@ -908,10 +971,11 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 	// The server stored the patch at version+1; remember it so its echo is not
 	// counted as the primary confirming the local hash (appstate/companion.go).
 	cli.appStateProc.NoteOwnPatch(patch.Type, version+1)
-	batch, eventsToDispatch, err := cli.fetchAppStateBatch(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
+	dispatched = true
 	go cli.dispatchAppStateBatch(batch, eventsToDispatch)
 
 	return nil
@@ -939,15 +1003,19 @@ func (cli *Client) applyAppStateConflicts(ctx context.Context, name appstate.WAP
 // in the publication order, which the caller must finish. As with fetches, a
 // failed batch gives its place up only after the sync lock is released.
 func (cli *Client) applyAppStateConflictBatch(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) (*appStateBatch, []any, error) {
-	if err := cli.admitAppStateBatch(name); err != nil {
-		return nil, nil, err
-	}
 	ctx, batch := newAppStateBatch(ctx, name)
+	batch.source = "conflict"
+	applied := false
+	defer func() {
+		if !applied {
+			cli.finishAppStateBatch(batch, nil)
+		}
+	}()
 	eventsToDispatch, err := cli.applyAppStateConflictsLocked(ctx, name, patches)
 	if err != nil {
-		cli.finishAppStateBatch(batch, nil)
 		return nil, nil, err
 	}
+	applied = true
 	return batch, eventsToDispatch, nil
 }
 
@@ -977,6 +1045,9 @@ func (cli *Client) applyAppStateConflictsLocked(ctx context.Context, name appsta
 	}
 	if len(pending.Patches) == 0 && pending.Snapshot == nil {
 		return nil, nil
+	}
+	if err = cli.claimAppState(ctx, name); err != nil {
+		return nil, err
 	}
 	var eventsToDispatch []any
 	if pending.Snapshot != nil {

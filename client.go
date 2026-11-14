@@ -110,10 +110,12 @@ type Client struct {
 	// full-sync capture/reset/restore, without holding a lock during downloads.
 	appStateRecoveryLocks sync.Map
 	appStatePublisher     appStatePublisher
-	// AppStateBacklogLimit is how many committed app state event batches of
-	// one collection may be undelivered (one in the event handlers plus those
-	// queued behind it) before fetches, sends and recovery adoptions of that
-	// collection fail with ErrAppStateBacklog instead of adding to them.
+	// AppStateBacklogLimit is how many app state event batches of one
+	// collection may be undelivered (one in the event handlers, those queued
+	// behind it, and those admitted and still running) before fetches, sends
+	// and recovery adoptions of that collection fail with ErrAppStateBacklog
+	// instead of adding to them. What a refused fetch skipped is fetched
+	// when the handlers have caught up (events.AppStateDeferred).
 	// Zero means DefaultAppStateBacklogLimit, a negative value no limit.
 	AppStateBacklogLimit int
 
