@@ -149,3 +149,40 @@ func TestAppStateRestartRecoveryFailsClosedAndRetries(t *testing.T) {
 	}
 	assertResetRecovered(t, reopened, hash, macs)
 }
+
+// A backup written after this instance's first read is not reconsidered by
+// later reads, only on request. A completed lower state stays once the
+// backup is retired.
+func TestAppStateRecoverBackupOnRequest(t *testing.T) {
+	s := newTestAppStateStore(t)
+	hash, macs := seedResetBackup(t, s)
+	if err := s.DeleteAppStateVersion(t.Context(), "regular"); err != nil {
+		t.Fatal(err)
+	}
+	if version, _, err := s.GetAppStateVersion(t.Context(), "regular"); err != nil || version != 0 {
+		t.Fatalf("a read restored the backup of a reset in flight: version=%d err=%v", version, err)
+	}
+	if err := s.RecoverAppStateBackup(t.Context(), "regular"); err != nil {
+		t.Fatal(err)
+	}
+	assertResetRecovered(t, s, hash, macs)
+
+	if err := s.PutAppStateBackup(t.Context(), "regular", 100, hash, macs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAppStateVersion(t.Context(), "regular"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutAppStatePatch(t.Context(), "regular", 1, hash, nil, macs); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAppStateBackup(t.Context(), "regular"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecoverAppStateBackup(t.Context(), "regular"); err != nil {
+		t.Fatal(err)
+	}
+	if version, _, err := s.GetAppStateVersion(t.Context(), "regular"); err != nil || version != 1 {
+		t.Fatalf("retired backup came back: version=%d err=%v", version, err)
+	}
+}

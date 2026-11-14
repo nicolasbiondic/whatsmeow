@@ -36,3 +36,12 @@ func (f *fakeAppStateVersionStore) ReplaceAppStateVersion(_ context.Context, _ s
 	}
 	return nil
 }
+
+// These stores keep no reset journal: there is nothing to recover or retire.
+func (m *memAppStateStore) RecoverAppStateBackup(context.Context, string) error { return nil }
+
+func (m *memAppStateStore) DeleteAppStateBackup(context.Context, string) error { return nil }
+
+func (f *fakeAppStateVersionStore) RecoverAppStateBackup(context.Context, string) error { return nil }
+
+func (f *fakeAppStateVersionStore) DeleteAppStateBackup(context.Context, string) error { return nil }

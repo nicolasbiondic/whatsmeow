@@ -22,7 +22,7 @@ type appStateRecoveryCheck struct {
 // PutAppStateBackup commits before the destructive reset. The backup does not
 // reference the version row, so deleting that row cannot cascade into it.
 func (s *SQLStore) PutAppStateBackup(ctx context.Context, name string, version uint64, hash [128]byte, macs []store.AppStateMutationMAC) error {
-	if err := s.recoverAppStateBackup(ctx, name); err != nil {
+	if err := s.recoverAppStateBackup(ctx, name, false); err != nil {
 		return err
 	}
 	raw, err := json.Marshal(macs)
@@ -50,15 +50,29 @@ func (s *SQLStore) ReplaceAppStateVersion(ctx context.Context, name string, vers
 	})
 }
 
-// Recover once per collection/store instance, before the first version read.
+// RecoverAppStateBackup restores a backup that a reset of this store instance
+// left behind when its own restore failed. Reads do not reconsider the backup
+// after their first check, as they cannot tell such a leftover from the
+// backup of a reset that is still replaying.
+func (s *SQLStore) RecoverAppStateBackup(ctx context.Context, name string) error {
+	return s.recoverAppStateBackup(ctx, name, true)
+}
+
+func (s *SQLStore) DeleteAppStateBackup(ctx context.Context, name string) error {
+	_, err := s.db.Exec(ctx, deleteAppStateBackupQuery, s.JID, name)
+	return err
+}
+
+// Recover once per collection/store instance, before the first version read,
+// and again whenever the owner of the collection asks (force).
 // A failed transaction leaves the journal intact and the read fails closed;
 // subsequent reads may retry. No partially restored version is exposed.
-func (s *SQLStore) recoverAppStateBackup(ctx context.Context, name string) error {
+func (s *SQLStore) recoverAppStateBackup(ctx context.Context, name string, force bool) error {
 	value, _ := s.appStateRecoveryChecks.LoadOrStore(name, &appStateRecoveryCheck{})
 	check := value.(*appStateRecoveryCheck)
 	check.Lock()
 	defer check.Unlock()
-	if check.done {
+	if check.done && !force {
 		return nil
 	}
 	err := s.db.DoTxn(ctx, nil, func(ctx context.Context) error {

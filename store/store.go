@@ -79,6 +79,13 @@ type AppStateStore interface {
 	// ReplaceAppStateVersion atomically replaces the complete collection and
 	// retires its reset backup only when the replacement commits.
 	ReplaceAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte, macs []AppStateMutationMAC) error
+	// RecoverAppStateBackup restores the state a reset left in its backup,
+	// also when this store instance has already read the collection. The
+	// caller guarantees that no reset of the collection is in flight.
+	RecoverAppStateBackup(ctx context.Context, name string) error
+	// DeleteAppStateBackup retires the reset backup. The caller guarantees
+	// that a complete verified state has replaced the one it preserved.
+	DeleteAppStateBackup(ctx context.Context, name string) error
 	PutAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte) error
 	GetAppStateVersion(ctx context.Context, name string) (uint64, [128]byte, error)
 	DeleteAppStateVersion(ctx context.Context, name string) error

@@ -149,6 +149,14 @@ func (n *NoopStore) PutAppStateBackup(ctx context.Context, name string, version 
 	return n.Error
 }
 
+func (n *NoopStore) RecoverAppStateBackup(ctx context.Context, name string) error {
+	return n.Error
+}
+
+func (n *NoopStore) DeleteAppStateBackup(ctx context.Context, name string) error {
+	return n.Error
+}
+
 func (n *NoopStore) ReplaceAppStateVersion(ctx context.Context, name string, version uint64, hash [128]byte, macs []AppStateMutationMAC) error {
 	return n.Error
 }

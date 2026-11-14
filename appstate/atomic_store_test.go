@@ -18,3 +18,7 @@ func (f *memAppStateStore) ReplaceAppStateVersion(ctx context.Context, name stri
 	f.versions[name], f.hashes[name], f.macs[name] = version, hash, next.macs[name]
 	return nil
 }
+
+func (f *memAppStateStore) RecoverAppStateBackup(context.Context, string) error { return nil }
+
+func (f *memAppStateStore) DeleteAppStateBackup(context.Context, string) error { return nil }

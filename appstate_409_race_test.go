@@ -263,6 +263,7 @@ type fakeSyncdServer struct {
 	// beforeConflict, when set, runs before a 409 response is delivered.
 	// Tests use it to order the race deterministically.
 	beforeConflict func()
+	reviewAllowSnapshot bool
 }
 
 func (s *fakeSyncdServer) appendPatch(raw []byte) uint64 {
@@ -332,7 +333,7 @@ func (s *fakeSyncdServer) handleIQ(ctx context.Context, iq *waBinary.Node) {
 		}
 	} else {
 		s.fetches.Add(1)
-		if ag.OptionalBool("return_snapshot") {
+		if ag.OptionalBool("return_snapshot") && !s.reviewAllowSnapshot {
 			s.t.Errorf("server: unexpected snapshot request for %s", name)
 		}
 		s.mu.Lock()

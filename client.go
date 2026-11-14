@@ -110,6 +110,12 @@ type Client struct {
 	// full-sync capture/reset/restore, without holding a lock during downloads.
 	appStateRecoveryLocks sync.Map
 	appStatePublisher     appStatePublisher
+	// AppStateBacklogLimit is how many committed app state event batches of
+	// one collection may be undelivered (one in the event handlers plus those
+	// queued behind it) before fetches, sends and recovery adoptions of that
+	// collection fail with ErrAppStateBacklog instead of adding to them.
+	// Zero means DefaultAppStateBacklogLimit, a negative value no limit.
+	AppStateBacklogLimit int
 
 	historySyncNotifications        chan *waE2E.HistorySyncNotification
 	historySyncHandlerStarted       atomic.Bool
@@ -704,6 +710,10 @@ func (cli *Client) IsConnected() bool {
 //
 // This will not emit any events, the Disconnected event is only used when the
 // connection is closed by the server or a network error.
+//
+// App state event batches that were already committed are neither dropped
+// nor waited for: event handlers can still be called after this returns.
+// Use WaitForAppStateEvents before removing them or closing their stores.
 func (cli *Client) Disconnect() {
 	if cli == nil {
 		return

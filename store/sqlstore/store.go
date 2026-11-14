@@ -528,7 +528,7 @@ func (s *SQLStore) PutAppStateVersion(ctx context.Context, name string, version 
 }
 
 func (s *SQLStore) GetAppStateVersion(ctx context.Context, name string) (version uint64, hash [128]byte, err error) {
-	if err = s.recoverAppStateBackup(ctx, name); err != nil {
+	if err = s.recoverAppStateBackup(ctx, name, false); err != nil {
 		return
 	}
 	return s.getAppStateVersion(ctx, name)

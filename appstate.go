@@ -75,6 +75,8 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 func (cli *Client) fetchAppStateBatch(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) (*appStateBatch, []any, error) {
 	if cli == nil {
 		return nil, nil, ErrClientIsNil
+	} else if err := cli.admitAppStateBatch(name); err != nil {
+		return nil, nil, err
 	}
 	ctx, batch := newAppStateBatch(ctx, name)
 	fetched := false
@@ -104,6 +106,9 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 	}
 	var backup *appStateVersionBackup
 	collectionLock := cli.appStateCollectionLock(name)
+	if err := cli.settleAppStateReset(ctx, name); err != nil {
+		return nil, err
+	}
 	if fullSync {
 		// Capture the current verified state so a failed full sync can put it
 		// back instead of leaving the collection empty. Without this, accounts
@@ -139,19 +144,24 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 			return nil, fmt.Errorf("failed to reset app state %s version: %w", name, deleteErr)
 		}
 	}
-	eventsToDispatch, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
-	if err == nil && backup != nil {
+	eventsToDispatch, replayed, err := cli.fetchAppStateAfterReset(ctx, name, fullSync, onlyIfNotSynced)
+	if err == nil && replayed {
 		// A successful full replay may intentionally establish a lower cursor
-		// (server reset). Seal that complete state and retire the journal, while
-		// preserving any recovery that committed during the download.
+		// (server reset), which no patch commit takes for superseding the
+		// journal. The replay is complete, so retire whatever reset journal
+		// exists: this attempt's, or one that an earlier attempt left behind
+		// and that the capture above could not see. A recovery that committed
+		// during the download stays as it is.
 		collectionLock.Lock()
-		current, captureErr := captureAppStateVersion(ctx, cli.Store.AppState, string(name))
-		if captureErr != nil {
-			err = fmt.Errorf("capture completed app state %s: %w", name, captureErr)
-		} else if current == nil {
+		version, _, versionErr := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+		if versionErr != nil {
+			err = fmt.Errorf("check completed app state %s: %w", name, versionErr)
+		} else if version != 0 {
+			if retireErr := cli.Store.AppState.DeleteAppStateBackup(ctx, string(name)); retireErr != nil {
+				err = fmt.Errorf("retire reset backup of app state %s: %w", name, retireErr)
+			}
+		} else if backup != nil {
 			err = fmt.Errorf("full sync of app state %s completed without a verified state", name)
-		} else {
-			err = cli.Store.AppState.ReplaceAppStateVersion(ctx, string(name), current.Version, current.Hash, current.MACs)
 		}
 		collectionLock.Unlock()
 	}
@@ -181,15 +191,32 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 	return eventsToDispatch, nil
 }
 
-func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
+// settleAppStateReset restores the state that a failed full sync left in its
+// reset journal when its own restore failed too. The caller holds
+// appStateSyncLock, so no reset is in flight and a journal can only be such a
+// leftover. Nothing may be built on the emptied collection it belongs to: a
+// replay to a lower cursor would not retire it, and a reopened store would
+// then put the journaled state back over that replay.
+func (cli *Client) settleAppStateReset(ctx context.Context, name appstate.WAPatchName) error {
+	lock := cli.appStateCollectionLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := cli.Store.AppState.RecoverAppStateBackup(ctx, string(name)); err != nil {
+		return fmt.Errorf("failed to recover unfinished reset of app state %s: %w", name, err)
+	}
+	return nil
+}
+
+// fetchAppStateAfterReset reports whether it replayed the collection from zero.
+func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, bool, error) {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get app state %s version: %w", name, err)
+		return nil, false, fmt.Errorf("failed to get app state %s version: %w", name, err)
 	}
 	if version == 0 {
 		fullSync = true
 	} else if onlyIfNotSynced {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	state := appstate.HashState{Version: version, Hash: hash}
@@ -216,17 +243,17 @@ func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WA
 			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
 				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
 			}
-			return nil, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
+			return nil, false, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
 		} else if !wantSnapshot && patches.Snapshot != nil {
-			return nil, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
+			return nil, false, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
 		} else if patches.Snapshot != nil && state != (appstate.HashState{}) {
-			return nil, fmt.Errorf("unexpected non-empty input state (v%d) for %s when applying snapshot", state.Version, name)
+			return nil, false, fmt.Errorf("unexpected non-empty input state (v%d) for %s when applying snapshot", state.Version, name)
 		}
 		wantSnapshot = false
 		hasMore = patches.HasMorePatches
 		state, err = cli.applyAppStatePatches(ctx, name, state, patches, fullSync, eventsToDispatchPtr)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if fullSync {
@@ -235,7 +262,7 @@ func (cli *Client) fetchAppStateAfterReset(ctx context.Context, name appstate.WA
 	} else {
 		cli.Log.Debugf("Synced app state %s from version %d to %d", name, version, state.Version)
 	}
-	return eventsToDispatch, nil
+	return eventsToDispatch, fullSync, nil
 }
 
 func (cli *Client) handleAppStateRecovery(
@@ -262,6 +289,11 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
+	if err = cli.admitAppStateBatch(name); err != nil {
+		// Not handled: the snapshot is neither adopted nor acknowledged.
+		cli.Log.Warnf("Not adopting app state recovery response for %s: %v", reqID, err)
+		return false
+	}
 	batch := &appStateBatch{name: name}
 	published := false
 	defer func() {
@@ -785,6 +817,9 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
+	} else if err := cli.admitAppStateBatch(patch.Type); err != nil {
+		// Refuse before sending: the events of the patch could not be queued.
+		return err
 	}
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
 	if err != nil {
@@ -904,6 +939,9 @@ func (cli *Client) applyAppStateConflicts(ctx context.Context, name appstate.WAP
 // in the publication order, which the caller must finish. As with fetches, a
 // failed batch gives its place up only after the sync lock is released.
 func (cli *Client) applyAppStateConflictBatch(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) (*appStateBatch, []any, error) {
+	if err := cli.admitAppStateBatch(name); err != nil {
+		return nil, nil, err
+	}
 	ctx, batch := newAppStateBatch(ctx, name)
 	eventsToDispatch, err := cli.applyAppStateConflictsLocked(ctx, name, patches)
 	if err != nil {
@@ -916,6 +954,9 @@ func (cli *Client) applyAppStateConflictBatch(ctx context.Context, name appstate
 func (cli *Client) applyAppStateConflictsLocked(ctx context.Context, name appstate.WAPatchName, patches *appstate.PatchList) ([]any, error) {
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	if err := cli.settleAppStateReset(ctx, name); err != nil {
+		return nil, err
+	}
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get app state %s version: %w", name, err)
