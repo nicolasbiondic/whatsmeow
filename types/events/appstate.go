@@ -232,8 +232,9 @@ type AppStateDeferred struct {
 }
 
 // AppStateCaughtUp is emitted when the client has made up for the work that
-// AppStateDeferred reported: a fetch of the collection completed with the
-// server, or the deferred recovery snapshot was adopted.
+// AppStateDeferred reported and owes the collection nothing more: a fetch of
+// the collection completed with the server, or the deferred recovery
+// snapshot was adopted and no fetch is owed besides.
 type AppStateCaughtUp struct {
 	Name    appstate.WAPatchName
 	Version uint64

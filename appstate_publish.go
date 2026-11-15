@@ -115,8 +115,10 @@ type appStatePublisher struct {
 	// disconnected is set from the moment the socket goes away until the
 	// next login: what is owed waits for that login (appStateDebtNext).
 	disconnected bool
-	// catchUp replaces Client.catchUpAppState in tests of the state machine.
+	// catchUp and adopt replace the two workers, Client.catchUpAppState and
+	// Client.adoptDeferredAppStateRecovery, in tests of the state machine.
 	catchUp func(name appstate.WAPatchName, connects uint64)
+	adopt   func(name appstate.WAPatchName, recovery *deferredAppStateRecovery)
 
 	// changed is closed whenever something a waiter looks at has changed.
 	changed chan struct{}

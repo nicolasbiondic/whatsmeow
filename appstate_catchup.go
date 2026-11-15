@@ -85,6 +85,7 @@ const (
 	debtTimerFired                                   // the retry timer of the current backoff fired
 	debtAttemptNoConnection                          // an attempt ended without a connection
 	debtAttemptFailed                                // an attempt ended with any other failure
+	debtRecoveryAdopted                              // a recovery snapshot of the collection was adopted
 	debtEvents
 )
 
@@ -99,11 +100,11 @@ const (
 
 // appStateDebtNext is the state machine of an owed fetch.
 //
-//	state    | refused | connected | disconnected | paused  | timer fired | attempt: no connection | attempt: failed
-//	ready    | ready   | ready     | offline *    | ready   | ready       | offline *              | backoff + (paused: ready; 5th: on hold *)
-//	backoff  | backoff | backoff   | offline *    | ready   | ready       | backoff                | backoff
-//	offline  | offline | ready 0   | offline      | offline | offline     | offline                | offline
-//	on hold  | ready 0 | ready 0   | offline      | on hold | on hold     | on hold                | on hold
+//	state    | refused | adopted | connected | disconnected | paused  | timer fired | attempt: no connection | attempt: failed
+//	ready    | ready   | ready   | ready     | offline *    | ready   | ready       | offline *              | backoff + (paused: ready; 5th: on hold *)
+//	backoff  | backoff | backoff | backoff   | offline *    | ready   | ready       | backoff                | backoff
+//	offline  | offline | offline | ready 0   | offline      | offline | offline     | offline                | offline
+//	on hold  | ready 0 | ready 0 | ready 0   | offline      | on hold | on hold     | on hold                | on hold
 //
 // "0" resets the failure count. "*" announces that nothing is scheduled
 // (events.AppStateCatchUpFailed without a RetryIn), "+" arms the retry timer
@@ -112,6 +113,12 @@ const (
 // nothing, and above all arms no timer. While app state is paused no timer
 // is armed either; the failure is counted and the resume starts the next
 // attempt.
+//
+// "adopted" is a recovery snapshot of the collection being adopted, on
+// arrival or later. Like a new refusal it is a new reason to try: the base
+// that the fetch kept failing on was replaced. It renews a debt on hold for
+// another bounded run of attempts and settles nothing, as the snapshot need
+// not contain what was refused.
 //
 // Other things happen to a debt without moving it: capacity coming back, the
 // resume, and an attempt that ended refused again or without covering the
@@ -145,7 +152,7 @@ func appStateDebtNext(state appStateDebtState, event appStateDebtEvent, paused b
 		}
 	case debtOnHold:
 		switch event {
-		case debtRefused, debtConnected:
+		case debtRefused, debtRecoveryAdopted, debtConnected:
 			return debtReady, 0, debtNoEffect
 		case debtDisconnected:
 			return debtOffline, failures, debtNoEffect
@@ -198,11 +205,22 @@ func (cli *Client) appStateDebtEventLocked(name appstate.WAPatchName, debt *appS
 	return effect, retryIn
 }
 
-// deferredAppStateRecovery is a recovery snapshot that the backlog refused.
-// Nothing fetched later can stand in for it, so the latest one per collection
-// is kept and adopted, through the same path as on arrival, when the backlog
-// has capacity again. It is dropped when the client is paused or
-// disconnected: an application that still needs it asks the primary again.
+// deferredAppStateRecovery is a recovery snapshot that the backlog refused:
+// the other thing a collection can be owed. Nothing fetched later can stand
+// in for it, so the latest one per collection is retained.
+//
+//	refused by the backlog            | retained, replacing an older one
+//	capacity, not paused, no worker   | the collection's worker adopts it, before any owed fetch
+//	adopted                           | gone; an owed fetch gets debtRecoveryAdopted
+//	refused again                     | stays retained, for the next kick
+//	not adopted (failed, superseded,  | dropped and reported
+//	no connection)                    |
+//	Disconnect, PauseAppState         | dropped and reported
+//
+// Being caught up is announced for a collection only when nothing is owed to
+// it any more: by the adoption if no fetch is owed, else by the fetch that
+// settles the debt. A dropped snapshot is not asked for again by the client:
+// an application that still needs it asks the primary again.
 type deferredAppStateRecovery struct {
 	reqID    types.MessageID
 	snapshot *waSyncdSnapshotRecovery.SyncdSnapshotRecovery
@@ -298,7 +316,11 @@ func (cli *Client) resumeAppStateCatchUpLocked(name appstate.WAPatchName) {
 	switch {
 	case recovery != nil && !p.paused && !busy && capacity:
 		p.catchingUp[name] = true
-		go cli.adoptDeferredAppStateRecovery(name, recovery)
+		adopt := p.adopt
+		if adopt == nil {
+			adopt = cli.adoptDeferredAppStateRecovery
+		}
+		go adopt(name, recovery)
 	case recovery == nil && appStateDebtStarts(debt.state, p.paused, busy, capacity):
 		p.catchingUp[name] = true
 		attempt := p.catchUp
@@ -425,8 +447,7 @@ func (cli *Client) retryAppStateCatchUp(name appstate.WAPatchName, debt *appStat
 
 // adoptDeferredAppStateRecovery adopts a snapshot that was refused on
 // arrival. Whatever comes of it, it is not tried twice: refused again it
-// stays for the next drain, adopted it is announced as caught up, and
-// anything else is reported and dropped, as it would have been on arrival.
+// stays for the next kick, and anything else ends it (endAppStateAdoption).
 func (cli *Client) adoptDeferredAppStateRecovery(name appstate.WAPatchName, recovery *deferredAppStateRecovery) {
 	ctx := cli.BackgroundEventCtx
 	if ctx == nil {
@@ -437,6 +458,12 @@ func (cli *Client) adoptDeferredAppStateRecovery(name appstate.WAPatchName, reco
 	if cli.IsConnected() {
 		_, err = cli.adoptAppStateRecovery(ctx, recovery, true)
 	}
+	cli.endAppStateAdoption(name, recovery, err)
+}
+
+// endAppStateAdoption is the end of the worker that adopts a retained
+// snapshot (see the table at deferredAppStateRecovery).
+func (cli *Client) endAppStateAdoption(name appstate.WAPatchName, recovery *deferredAppStateRecovery, err error) {
 	p := &cli.appStatePublisher
 	p.mu.Lock()
 	delete(p.catchingUp, name)
@@ -446,7 +473,7 @@ func (cli *Client) adoptDeferredAppStateRecovery(name appstate.WAPatchName, reco
 		if p.recoveries[name] == recovery {
 			delete(p.recoveries, name)
 		}
-		cli.noticeAppStateLocked(&events.AppStateCaughtUp{Name: name, Version: recovery.version})
+		cli.appStateRecoveryAdoptedLocked(name, recovery.version)
 	} else if !refused {
 		cli.dropAppStateRecoveryLocked(name, recovery, err)
 	}
@@ -454,6 +481,20 @@ func (cli *Client) adoptDeferredAppStateRecovery(name appstate.WAPatchName, reco
 	p.mu.Unlock()
 	if err != nil && !refused {
 		cli.Log.Errorf("Dropped the app state %s recovery snapshot v%d that was deferred by the event backlog (%s): %v", name, recovery.version, recovery.reqID, err)
+	}
+}
+
+// appStateRecoveryAdoptedLocked tells the collection's owed fetch that a
+// snapshot was adopted. deferredVersion is that of a snapshot the
+// application was told is deferred, or zero for one adopted on arrival: the
+// first is announced as caught up, unless a fetch is still owed, which then
+// makes the announcement when it is settled.
+func (cli *Client) appStateRecoveryAdoptedLocked(name appstate.WAPatchName, deferredVersion uint64) {
+	p := &cli.appStatePublisher
+	if debt := p.owed[name]; debt != nil {
+		cli.appStateDebtEventLocked(name, debt, debtRecoveryAdopted, nil)
+	} else if deferredVersion != 0 {
+		cli.noticeAppStateLocked(&events.AppStateCaughtUp{Name: name, Version: deferredVersion})
 	}
 }
 

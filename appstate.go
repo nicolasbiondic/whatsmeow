@@ -339,7 +339,14 @@ func (cli *Client) handleAppStateRecovery(
 	handled, err := cli.adoptAppStateRecovery(ctx, &deferredAppStateRecovery{
 		reqID: reqID, snapshot: snapshot, version: snapshot.GetVersion().GetVersion(),
 	}, false)
-	if err != nil && !errors.Is(err, ErrAppStateBacklog) && !errors.Is(err, ErrAppStatePaused) {
+	if err == nil {
+		// Adopted on arrival: an owed fetch of the collection has a new
+		// reason to try (see appStateDebtNext).
+		p := &cli.appStatePublisher
+		p.mu.Lock()
+		cli.appStateRecoveryAdoptedLocked(appstate.WAPatchName(snapshot.GetCollectionName()), 0)
+		p.mu.Unlock()
+	} else if !errors.Is(err, ErrAppStateBacklog) && !errors.Is(err, ErrAppStatePaused) {
 		cli.Log.Warnf("Did not adopt app state recovery response for %s: %v", reqID, err)
 	}
 	return handled
